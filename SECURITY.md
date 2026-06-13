@@ -9,7 +9,7 @@ seriously.
 **Please do not open a public issue for security vulnerabilities.**
 
 Report privately via GitHub's
-[private vulnerability reporting](https://github.com/island-open-source/mila/security/advisories/new),
+[private vulnerability reporting](https://github.com/island-io/mila/security/advisories/new),
 or email **uri@island.io**. We aim to acknowledge reports within a few
 business days.
 

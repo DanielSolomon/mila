@@ -41,7 +41,7 @@
 	<key>SUEnableAutomaticChecks</key>
 	<true/>
 	<key>SUFeedURL</key>
-	<string>https://island-open-source.github.io/mila/appcast.xml</string>
+	<string>https://island-io.github.io/mila/appcast.xml</string>
 	<key>SUPublicEDKey</key>
 	<string>iF35blPidKUXIaLr59fJgGGdXtI8AgVNxOx5w+eTieY=</string>
 	<key>SUScheduledCheckInterval</key>

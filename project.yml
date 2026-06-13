@@ -135,7 +135,7 @@ targets:
         # GitHub Pages; release binaries are attached to GitHub Releases. Forks
         # that want their own update channel should point this at their own
         # appcast and sign releases with their own EdDSA key (see SUPublicEDKey).
-        SUFeedURL: https://island-open-source.github.io/mila/appcast.xml
+        SUFeedURL: https://island-io.github.io/mila/appcast.xml
         SUPublicEDKey: iF35blPidKUXIaLr59fJgGGdXtI8AgVNxOx5w+eTieY=
         SUEnableAutomaticChecks: true
         SUScheduledCheckInterval: 86400
