@@ -17,7 +17,20 @@ settings:
     SWIFT_STRICT_CONCURRENCY: minimal
     GENERATE_INFOPLIST_FILE: NO
     PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisper
-    MARKETING_VERSION: "1.8.12"
+    MARKETING_VERSION: "1.8.13"
+    # 1.8.13:
+    #   * Live AI: throttle the LLM feed to a configurable minimum
+    #     interval (default 20s) + stop the recording view re-rendering
+    #     the transcript at audio cadence (LazyVStack + isolated elapsed
+    #     clock). Large CPU reduction on long recordings.
+    #   * Diarization now defaults OFF (a one-time migration also turns
+    #     it off for existing users) to cut the continuous pyannote
+    #     subprocess CPU draw; re-enable in Settings ▸ Diarization.
+    #   * Fixed Hebrew RTL alignment of the summary / action items /
+    #     transcript in both the live and saved views; the saved summary
+    #     now renders as a few readable lines, not one run-on block.
+    #   * New: prompt to stop recording when a Zoom meeting ends.
+    #   * New: pre-update "What's New" popup.
     # 1.7.0 ships eight features in one batch:
     #   * Adaptive mic gain control (AGC): boosts low-volume input to
     #     a -26 dBFS target with smooth attack/release + soft clip.
@@ -61,7 +74,7 @@ settings:
     #     labels at stop time so the final utterance gets its
     #     speaker label before saving (4 race fixes from Bugbot
     #     review). Still writes the .srt sidecar.
-    CURRENT_PROJECT_VERSION: "49"
+    CURRENT_PROJECT_VERSION: "50"
 
 packages:
   TranscriptionCore:
