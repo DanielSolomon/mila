@@ -2,18 +2,28 @@ import XCTest
 @testable import Mila
 
 /// Covers `AIOverviewSection.summaryAttributed` — the saved-recording
-/// summary renderer. A single-paragraph summary is split into one bullet
-/// per sentence; the key risk (the bug a naive ".!?" split introduced) is
-/// chopping decimals / abbreviations / domains / URLs mid-token.
+/// summary renderer. It renders a few PROSE lines with NO bullets (the
+/// action-items section is the bulleted list). Risks: chopping decimals /
+/// abbreviations / domains / URLs mid-token, and leaving bullet markers in.
 final class AIOverviewSummaryTests: XCTestCase {
 
     private func plain(_ a: AttributedString) -> String { String(a.characters) }
 
-    func test_multiSentence_paragraph_splits_into_bullets() {
+    func test_multiSentence_paragraph_splits_into_lines_without_bullets() {
         let s = "We shipped the beta. Dana will send the deck. Yossi books the room."
         let out = plain(AIOverviewSection.summaryAttributed(s))
-        let bulletLines = out.components(separatedBy: "\n").filter { $0.contains("•") }
-        XCTAssertEqual(bulletLines.count, 3, "three sentences → three bullet lines")
+        XCTAssertEqual(out.components(separatedBy: "\n").count, 3, "three sentences → three lines")
+        XCTAssertFalse(out.contains("•"), "summary must NOT be a bulleted list")
+    }
+
+    func test_llm_dash_bullets_are_stripped() {
+        let s = "- First point.\n- Second point.\n- Third point."
+        let out = plain(AIOverviewSection.summaryAttributed(s))
+        XCTAssertEqual(out.components(separatedBy: "\n").count, 3)
+        XCTAssertFalse(out.contains("•"))
+        XCTAssertFalse(out.split(separator: "\n").contains { $0.hasPrefix("- ") },
+                       "leading '- ' markers must be stripped")
+        XCTAssertTrue(out.contains("First point."))
     }
 
     func test_decimals_and_abbreviations_are_not_split_midtoken() {
@@ -21,8 +31,6 @@ final class AIOverviewSummaryTests: XCTestCase {
         let out = plain(AIOverviewSection.summaryAttributed(s))
         XCTAssertTrue(out.contains("3.30"), "decimal time must stay intact")
         XCTAssertTrue(out.contains("1.5M"), "decimal figure must stay intact")
-        XCTAssertFalse(out.contains("3.\u{00A0}") || out.contains("•\u{00A0}30"),
-                       "must not bullet in the middle of a decimal")
     }
 
     func test_domains_and_urls_are_not_split() {
@@ -34,7 +42,7 @@ final class AIOverviewSummaryTests: XCTestCase {
 
     func test_single_sentence_is_not_bulleted() {
         let out = plain(AIOverviewSection.summaryAttributed("Just one short note."))
-        XCTAssertFalse(out.contains("•"), "a single sentence shouldn't get a bullet")
+        XCTAssertFalse(out.contains("•"))
     }
 
     func test_empty_or_blank_is_safe() {
@@ -42,11 +50,11 @@ final class AIOverviewSummaryTests: XCTestCase {
         XCTAssertTrue(plain(AIOverviewSection.summaryAttributed("   ")).isEmpty)
     }
 
-    func test_existing_multiline_markdown_is_preserved() {
+    func test_multiline_markdown_content_preserved_without_bullets() {
         let s = "**Topic:** test\n\n- did a thing\n- found a bug"
         let out = plain(AIOverviewSection.summaryAttributed(s))
-        // Already structured → kept as-is (not re-bulleted by sentence split).
         XCTAssertTrue(out.contains("did a thing"))
         XCTAssertTrue(out.contains("found a bug"))
+        XCTAssertFalse(out.contains("•"))
     }
 }

@@ -209,37 +209,50 @@ struct AIOverviewSection: View {
         items.map { "• \($0.text)" }.joined(separator: "\n")
     }
 
-    /// Turn a stored summary into a few readable lines. The LLM emits
-    /// either a short run-on paragraph (the live rolling summary) or a
-    /// multi-line markdown block (the one-shot summarizer). A paragraph
-    /// with no line breaks is split into one bullet per sentence so it
-    /// reads as a few lines — matching the live recording pane — while a
-    /// block that already has line structure is kept as-is. Inline
-    /// markdown (`**bold**` etc.) is rendered; `\n` and literal "- " are
-    /// preserved.
+    /// Turn a stored summary into a few readable PROSE lines — never a
+    /// bulleted list (that's the action-items section's job). The LLM
+    /// emits either a short run-on paragraph (the live rolling summary)
+    /// or a multi-line block, sometimes with its own "- " bullets (the
+    /// one-shot summarizer). We render each sentence / source line on its
+    /// own line with NO bullet, stripping any leading bullet marker the
+    /// LLM emitted. Inline markdown (`**bold**` etc.) is still rendered.
     static func summaryAttributed(_ raw: String) -> AttributedString {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        let body: String
+        guard !trimmed.isEmpty else { return AttributedString("") }
+
+        let sourceLines: [String]
         if trimmed.contains("\n") {
-            body = trimmed
+            // Already has line structure (often the LLM's own bullets).
+            sourceLines = trimmed.components(separatedBy: "\n")
         } else {
-            // Proper sentence segmentation via Foundation's tokenizer.
-            // A naive split on bare ".!?" mangled "3.30 p.m.", "v2.0",
-            // "acme.com", "https://…" into garbled mid-token bullets;
-            // `.bySentences` keeps those intact.
+            // Single run-on paragraph → one sentence per line. Foundation's
+            // `.bySentences` tokenizer keeps "3.30 p.m." / "v2.0" / URLs
+            // intact (a naive ".!?" split mangled them).
             var sentences: [String] = []
             trimmed.enumerateSubstrings(in: trimmed.startIndex..<trimmed.endIndex,
                                         options: [.bySentences, .localized]) { sub, _, _, _ in
                 let s = (sub ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 if !s.isEmpty { sentences.append(s) }
             }
-            body = sentences.count > 1
-                ? sentences.map { "•\u{00A0}\($0)" }.joined(separator: "\n")
-                : trimmed
+            sourceLines = sentences
         }
+        let body = sourceLines
+            .map { Self.stripLeadingBullet($0.trimmingCharacters(in: .whitespaces)) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+
         let opts = AttributedString.MarkdownParsingOptions(
             interpretedSyntax: .inlineOnlyPreservingWhitespace)
         return (try? AttributedString(markdown: body, options: opts)) ?? AttributedString(body)
+    }
+
+    /// Remove a single leading bullet marker ("- ", "* ", "• ", "·") so a
+    /// summary line reads as prose, not a list item.
+    private static func stripLeadingBullet(_ line: String) -> String {
+        for marker in ["- ", "* ", "• ", "•\u{00A0}", "· ", "·\u{00A0}"] {
+            if line.hasPrefix(marker) { return String(line.dropFirst(marker.count)) }
+        }
+        return line
     }
 
     fileprivate static func copyToPasteboard(_ text: String) {
