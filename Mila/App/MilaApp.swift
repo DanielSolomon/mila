@@ -9,24 +9,183 @@ import Sparkle
 /// already in flight. Created once at app launch — Sparkle starts its
 /// scheduled background poll immediately (interval comes from
 /// `SUScheduledCheckInterval` in Info.plist).
+///
+/// It ALSO drives the custom pre-update "What's New" popup. When Sparkle's
+/// scheduled background poll finds a newer valid version, we intercept it
+/// via the gentle-reminder delegate hooks: `availableUpdate` is published so
+/// `ContentView` can present `WhatsNewPopup` instead of Sparkle's stock
+/// "update available" window. "Update Now" calls back into Sparkle's normal
+/// install flow; "Later" dismisses. A USER-initiated "Check for Updates…"
+/// (from the app menu) always uses Sparkle's standard UI — we only swap in
+/// the custom popup for the silent scheduled discovery, which is where the
+/// enticement matters.
+///
+/// Content for the popup comes from the appcast item's release notes
+/// (`SUAppcastItem.itemDescription`): the installed app can't carry a
+/// not-yet-released version's local notes, so "populate every new version"
+/// means writing per-release highlights into each appcast `<description>`.
 @MainActor
-final class UpdaterViewModel: ObservableObject {
-    let controller: SPUStandardUpdaterController
+final class UpdaterViewModel: NSObject, ObservableObject,
+                              SPUUpdaterDelegate, SPUStandardUserDriverDelegate {
+    /// Implicitly-unwrapped because Sparkle wires its delegates at
+    /// controller-construction time and holds them weakly, so the controller
+    /// can only be built AFTER `super.init()` makes `self` available as the
+    /// delegate. It's always non-nil by the end of `init`.
+    private(set) var controller: SPUStandardUpdaterController!
     @Published var canCheckForUpdates = false
 
-    init() {
-        controller = SPUStandardUpdaterController(
+    /// The update we want the custom popup to show. Non-nil iff a scheduled
+    /// poll found a newer version we haven't already shown the user.
+    /// `ContentView` binds a `.sheet(item:)` to this.
+    @Published var availableUpdate: WhatsNewUpdate?
+
+    /// True while a user-initiated check is in flight. During this window we
+    /// let Sparkle's STANDARD UI handle everything (the menu command is an
+    /// explicit ask — no enticement needed) instead of swapping in the popup.
+    private var userInitiatedCheckInFlight = false
+
+    private let gate: WhatsNewGate
+
+    /// `defaults` is injectable so tests can isolate the "last seen version"
+    /// persistence. In the app it's `.standard`.
+    init(defaults: UserDefaults = .standard) {
+        self.gate = WhatsNewGate(defaults: defaults)
+        super.init()
+        // Sparkle wires its delegates at controller-construction time (they
+        // can't be reassigned afterward) and holds them weakly, so the
+        // controller can only be built now that `self` exists to act as the
+        // delegate. Starting the updater here kicks off the scheduled poll
+        // (interval from `SUScheduledCheckInterval` in Info.plist).
+        self.controller = SPUStandardUpdaterController(
             startingUpdater: true,
-            updaterDelegate: nil,
-            userDriverDelegate: nil
+            updaterDelegate: self,
+            userDriverDelegate: self
         )
         controller.updater.publisher(for: \.canCheckForUpdates)
             .receive(on: DispatchQueue.main)
             .assign(to: &$canCheckForUpdates)
+
+        // UI-test seam: force the "What's New" popup to appear with fixture
+        // release-notes content, without needing a live appcast / a newer
+        // published version. Exercised by
+        // `WhatsNewPopupUITests.test_whats_new_popup_shows_highlights_and_update_button`.
+        if CommandLine.arguments.contains("--ui-test-show-whats-new") {
+            self.availableUpdate = WhatsNewUpdate(
+                displayVersion: "9.9.9",
+                releaseNotesHTML: """
+                <h2>What's New</h2>
+                <ul>
+                  <li>Live AI meeting summaries are now faster and more accurate</li>
+                  <li>Speaker labels stay stable across long recordings</li>
+                  <li>New diagnostic report export for easier bug reports</li>
+                </ul>
+                """
+            )
+        }
     }
 
+    /// User picked "Check for Updates…" from the menu. Flag it so the
+    /// gentle-reminder delegate lets Sparkle's standard UI run, then check.
     func checkForUpdates() {
+        userInitiatedCheckInFlight = true
         controller.checkForUpdates(nil)
+    }
+
+    /// "Update Now" from the custom popup. Re-enter Sparkle's flow: it has
+    /// the found update cached, so this brings up the standard install/confirm
+    /// path immediately. We mark this as user-initiated so we don't recurse
+    /// into the custom popup again.
+    func proceedWithUpdate() {
+        markSeenAndClear()
+        userInitiatedCheckInFlight = true
+        controller.checkForUpdates(nil)
+    }
+
+    /// "Later" / ESC on the popup. Remember this version as seen so the next
+    /// scheduled poll doesn't immediately re-pop it, and drop the model.
+    func dismissUpdate() {
+        markSeenAndClear()
+    }
+
+    private func markSeenAndClear() {
+        if let version = availableUpdate?.displayVersion {
+            gate.markSeen(version: version)
+        }
+        availableUpdate = nil
+    }
+
+    // MARK: - SPUUpdaterDelegate
+
+    /// Sparkle found a newer valid version. Capture its release notes for the
+    /// custom popup. This fires for both scheduled and user-initiated checks;
+    /// `standardUserDriverShouldHandleShowingScheduledUpdate` decides which UI
+    /// actually shows.
+    nonisolated func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
+        let version = item.displayVersionString
+        let notes = item.itemDescription
+        Task { @MainActor in
+            // A user-initiated "Check for Updates…" (menu command, or
+            // "Update Now" from the popup) is owned end-to-end by Sparkle's
+            // STANDARD driver — it puts up its own "update available" window.
+            // If we ALSO recorded the custom popup here, BOTH would appear.
+            // Bail in that case so exactly one UI shows. The silent scheduled
+            // background poll leaves this flag false, so the custom popup
+            // still owns that path.
+            guard !self.userInitiatedCheckInFlight else { return }
+            guard self.gate.shouldShow(availableVersion: version) else { return }
+            self.availableUpdate = WhatsNewUpdate(
+                displayVersion: version,
+                releaseNotesHTML: notes
+            )
+        }
+    }
+
+    // MARK: - SPUStandardUserDriverDelegate
+
+    /// Opt into gentle reminders so Sparkle asks us (below) whether to handle
+    /// scheduled-update UI itself.
+    nonisolated var supportsGentleScheduledUpdateReminders: Bool { true }
+
+    /// Return `false` for a SCHEDULED (background-poll) discovery so the
+    /// delegate (our custom `WhatsNewPopup`) owns presentation instead of
+    /// Sparkle's stock window.
+    ///
+    /// This method is NOT called for user-initiated checks — per
+    /// `SPUStandardUserDriverDelegate.h`, "the standard user driver always
+    /// handles those." So we must NOT branch on `immediateFocus`: it merely
+    /// reflects whether the app was launched recently / the system is idle
+    /// (a common path), NOT whether the check was user-initiated. Branching
+    /// on it was why Sparkle's stock window ALSO popped on the launch poll.
+    ///
+    /// We only return `false` when the gate says we'd actually show a popup
+    /// for this version. If the gate would suppress the popup (e.g. the user
+    /// already dismissed this version), let Sparkle's standard UI handle it so
+    /// a scheduled discovery never ends up with no UI at all.
+    nonisolated func standardUserDriverShouldHandleShowingScheduledUpdate(
+        _ update: SUAppcastItem,
+        andInImmediateFocus immediateFocus: Bool
+    ) -> Bool {
+        let version = update.displayVersionString
+        return MainActor.assumeIsolated {
+            !self.gate.shouldShow(availableVersion: version)
+        }
+    }
+
+    /// Called when an update CHECK CYCLE finishes — update scheduled, no
+    /// update found, dismissed/skipped, or aborted (per `SPUUpdaterDelegate.h`).
+    /// Reset the user-initiated flag here so the NEXT scheduled poll is treated
+    /// as scheduled again. We use this terminal callback rather than
+    /// `standardUserDriverWillHandleShowingUpdate` (which fires BEFORE the
+    /// update window appears and not at all for "no update found", which would
+    /// leave the flag stuck `true` after a user check that finds nothing).
+    nonisolated func updater(
+        _ updater: SPUUpdater,
+        didFinishUpdateCycleFor updateCheck: SPUUpdateCheck,
+        error: Error?
+    ) {
+        Task { @MainActor in
+            self.userInitiatedCheckInFlight = false
+        }
     }
 }
 
@@ -300,6 +459,7 @@ struct MilaApp: App {
                 .environmentObject(liveTranscriber)
                 .environmentObject(liveSpeakerDiarizer)
                 .environmentObject(liveAISession)
+                .environmentObject(updater)
                 .frame(minWidth: 1000, minHeight: 640)
                 .task { ensureDefaultModelsInstalled() }
                 .task { prewarmDefaultModel() }
