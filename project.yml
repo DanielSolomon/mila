@@ -17,7 +17,14 @@ settings:
     SWIFT_STRICT_CONCURRENCY: minimal
     GENERATE_INFOPLIST_FILE: NO
     PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisper
-    MARKETING_VERSION: "1.8.13"
+    MARKETING_VERSION: "1.8.14"
+    # 1.8.14:
+    #   * Live AI: guarantee a fresh Claude session per recording so a new
+    #     recording's summary / action items can never inherit a previous
+    #     recording's content (cross-recording bleed). The per-recording
+    #     reset is now deterministic at record-start; cancel() clears the
+    #     rolling summary/action items; session new/resume decisions are
+    #     logged to OSLog so diagnostic reports can prove isolation. (#30)
     # 1.8.13:
     #   * Live AI: throttle the LLM feed to a configurable minimum
     #     interval (default 20s) + stop the recording view re-rendering
@@ -74,7 +81,7 @@ settings:
     #     labels at stop time so the final utterance gets its
     #     speaker label before saving (4 race fixes from Bugbot
     #     review). Still writes the .srt sidecar.
-    CURRENT_PROJECT_VERSION: "50"
+    CURRENT_PROJECT_VERSION: "51"
 
 packages:
   TranscriptionCore:
