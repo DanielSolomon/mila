@@ -207,6 +207,57 @@ final class LLMRunnerTests: XCTestCase {
         }
     }
 
+    /// Regression: after a timeout-kill, the pipe drain used to be an
+    /// UNBOUNDED wait for EOF. A grandchild the CLI spawned (MCP server,
+    /// node helper) that inherited stdout/stderr and survived the parent's
+    /// SIGKILL kept the pipes open — `run` then never returned, leaving the
+    /// caller's in-flight slot (summarizer spinner, Live AI tick) stuck
+    /// permanently. The script models that: a background `sleep` inherits
+    /// stdout and outlives its killed parent. `run` must still return
+    /// `.timedOut` promptly instead of waiting out the grandchild.
+    func test_timeout_returns_even_when_grandchild_holds_pipes_open() async {
+        // The grandchild's PID is parked in a file so the test can reap it
+        // on exit — otherwise every run leaves a stray `sleep 60` behind.
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mila-grandchild-\(UUID().uuidString).pid")
+        let script = makeScript("""
+            #!/bin/sh
+            sleep 60 &
+            echo $! > "\(pidFile.path)"
+            sleep 60
+            """)
+        defer {
+            if let pidText = try? String(contentsOf: pidFile, encoding: .utf8),
+               let pid = Int32(pidText.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                kill(pid, SIGKILL)
+            }
+            try? FileManager.default.removeItem(at: pidFile)
+            try? FileManager.default.removeItem(at: script)
+        }
+
+        let started = Date()
+        do {
+            _ = try await LLMRunner.run(tool: .claude,
+                                        prompt: "x",
+                                        transcript: "y",
+                                        executablePathOverride: script.path,
+                                        timeout: 1)
+            XCTFail("Expected timedOut error")
+        } catch let error as LLMRunnerError {
+            guard case .timedOut = error else {
+                XCTFail("Wrong error: \(error)")
+                return
+            }
+        } catch {
+            XCTFail("Wrong error type: \(error)")
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        // Generous CI bound (same flake class as the plain timeout test) —
+        // the point is "returns in seconds, not after the grandchild's 60s".
+        XCTAssertLessThan(elapsed, 40,
+                          "run() must not wait for the orphaned grandchild to release the pipes; took \(elapsed)s")
+    }
+
     // MARK: - Real-CLI smoke tests
     //
     // These hit the actual `claude` / `cursor-agent` binaries if installed.

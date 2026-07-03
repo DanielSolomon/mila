@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Errors surfaced from the CLI invocation. The Settings UI / rename sheet
 /// renders `errorDescription` directly so users can self-diagnose path /
@@ -417,18 +418,23 @@ enum LLMRunner {
 
         // Read stdout/stderr eagerly on background queues so a chatty CLI
         // can't deadlock by filling the OS pipe buffer while we waitUntilExit.
-        var outData = Data()
-        var errData = Data()
+        // Chunked reads into lock-guarded boxes (not one readDataToEndOfFile
+        // into a captured var) so the bounded drain below can snapshot what
+        // arrived so far without racing a still-blocked reader.
+        let outBox = OSAllocatedUnfairLock(initialState: Data())
+        let errBox = OSAllocatedUnfairLock(initialState: Data())
         let group = DispatchGroup()
-        group.enter()
-        DispatchQueue.global().async {
-            outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            group.leave()
-        }
-        group.enter()
-        DispatchQueue.global().async {
-            errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-            group.leave()
+        for (pipe, box) in [(stdoutPipe, outBox), (stderrPipe, errBox)] {
+            group.enter()
+            DispatchQueue.global().async {
+                let handle = pipe.fileHandleForReading
+                while true {
+                    let chunk = handle.availableData   // blocks until data or EOF
+                    if chunk.isEmpty { break }
+                    box.withLock { $0.append(chunk) }
+                }
+                group.leave()
+            }
         }
 
         // Bounded wait — kill the process if it's still running at deadline.
@@ -447,15 +453,53 @@ enum LLMRunner {
             process.terminate()
             if runningGroup.wait(timeout: .now() + 1) == .timedOut {
                 kill(process.processIdentifier, SIGKILL)
-                runningGroup.wait()
+                // BOUNDED: `waitUntilExit` has been observed never returning
+                // even after a SIGKILL (macOS 26, sampled live — likely a
+                // reaping race inside NSTask). The child is dead-or-dying
+                // either way, and this is the timedOut path so its exit
+                // status is already being discarded — don't hang the caller
+                // (and its awaiting continuation) on the obituary.
+                if runningGroup.wait(timeout: .now() + 5) == .timedOut {
+                    print("LLMRunner: waitUntilExit didn't return after SIGKILL — abandoning the wait")
+                }
             }
         }
-        // Drain the pipe readers once the process is known to be gone (either it
-        // exited on its own or we killed it above).
-        group.wait()
+        // Drain the pipe readers once the process is known to be gone.
+        if timedOut || handle.wasTerminated {
+            // Killed path: BOUNDED. A grandchild that inherited the pipes
+            // and survived the kill (an MCP server or node helper the CLI
+            // spawned) holds them open indefinitely, and an unbounded wait
+            // here hung this method (and the awaiting continuation, and
+            // the caller's in-flight slot) forever. The output is being
+            // discarded anyway (the caller sees .timedOut / .cancelled),
+            // so after the grace we move on; the leaked reader threads
+            // exit when the pipes finally close.
+            if group.wait(timeout: .now() + 3) == .timedOut {
+                print("LLMRunner: pipe drain timed out after kill — an orphaned grandchild is still holding stdout/stderr; returning partial output")
+            }
+        } else {
+            // Normal exit: bounded too, but with a GENEROUS grace. Two
+            // opposing constraints meet here:
+            //  * The child closed its write ends when it died, so the
+            //    readers hit EOF as soon as they get CPU — on a loaded
+            //    macos-26 CI VM that can be 10s+ of dispatch latency, and
+            //    a tight 3s bound truncated perfectly good output
+            //    mid-stream (test_runner_spawns_child_in_isolated_temp_
+            //    directory went flaky on CI).
+            //  * EOF is not GUARANTEED even after exit 0 — a helper the
+            //    CLI spawned (MCP server, node daemon) can inherit the
+            //    pipes and keep them open indefinitely; an unbounded wait
+            //    hung the caller forever.
+            // 30s clears any realistic dispatch latency while still
+            // returning the (fully buffered by then) output if a
+            // pipe-holding helper never lets EOF arrive.
+            if group.wait(timeout: .now() + 30) == .timedOut {
+                print("LLMRunner: pipe drain timed out after normal exit — a helper process is still holding stdout/stderr; returning buffered output")
+            }
+        }
 
-        let stdout = String(data: outData, encoding: .utf8) ?? ""
-        let stderr = String(data: errData, encoding: .utf8) ?? ""
+        let stdout = String(data: outBox.withLock { $0 }, encoding: .utf8) ?? ""
+        let stderr = String(data: errBox.withLock { $0 }, encoding: .utf8) ?? ""
 
         return ProcessOutcome(stdout: stdout,
                               stderr: stderr,
@@ -567,11 +611,20 @@ enum LLMRunner {
 final class ProcessHandle: @unchecked Sendable {
     private let lock = NSLock()
     private var process: Process?
-    private(set) var wasTerminated = false
+    private var _wasTerminated = false
+
+    /// Lock-protected read: `terminate()` sets the flag from whatever
+    /// thread cancellation lands on while `executeProcess` reads it from
+    /// its own context — an unlocked read is a data race (and could steer
+    /// the drain-path choice wrong).
+    var wasTerminated: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _wasTerminated
+    }
 
     func attach(_ p: Process) {
         lock.lock(); defer { lock.unlock() }
-        if wasTerminated {
+        if _wasTerminated {
             // Cancel beat us to attach — the Task was already cancelled
             // before the Process even started. Reach out and SIGTERM right
             // now so the child doesn't even get a head start.
@@ -583,7 +636,7 @@ final class ProcessHandle: @unchecked Sendable {
 
     func terminate() {
         lock.lock(); defer { lock.unlock() }
-        wasTerminated = true
+        _wasTerminated = true
         process?.terminate()
     }
 }
