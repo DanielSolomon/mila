@@ -598,11 +598,7 @@ final class QuickActionsController: ObservableObject {
         // live pane. Now the dialog pops up instantly; the
         // background drain below updates the Recording (and thus
         // the sheet, which observes the store) as more data lands.
-        let initialSegments = liveTranscriber?.segments ?? []
-        let initialTranscriptSegments: [TranscriptSegment] = initialSegments.map { ls in
-            TranscriptSegment(start: ls.startSeconds, end: ls.endSeconds,
-                              text: ls.text, speaker: ls.speaker)
-        }
+        let initialTranscriptSegments = liveTranscriber?.transcriptSegments ?? []
         let initialSummary = (liveAISession?.summary ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let initialItems = liveAISession?.actionItems ?? []
@@ -613,7 +609,7 @@ final class QuickActionsController: ObservableObject {
         // the drain task. Mirrors `useLiveTranscript` below: both VAD
         // and chunk modes produce live segments we want to preserve,
         // so the initial-status gate is segment-presence, not mode.
-        let initialStatus: TranscriptionStatus = initialSegments.isEmpty ? .pending : .running
+        let initialStatus: TranscriptionStatus = initialTranscriptSegments.isEmpty ? .pending : .running
         let recording = Recording(
             title: title,
             duration: duration,
