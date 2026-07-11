@@ -85,6 +85,17 @@ final class TranscriptionService: ObservableObject {
     /// exists). For first-time transcription it's `false`.
     var onTranscriptionCompleted: ((Recording, _ wasRetranscription: Bool) -> Void)?
 
+    /// Auto-drop gate for accidental short+empty captures (issue #61). Wired
+    /// by `MilaApp` to the user's `recordings.minDuration` threshold. Given a
+    /// just-finished recording's duration + transcript, returns `true` when
+    /// the clip should be dropped — i.e. it's BOTH shorter than the threshold
+    /// AND has no transcript (a hotkey misfire / silence). Short clips that
+    /// DID produce text, and anything at/over the threshold, return `false`
+    /// (kept). `nil` — the default, used by every test that doesn't opt in —
+    /// means "never drop", so transcription behaviour is unchanged unless the
+    /// app explicitly wires the gate.
+    var shouldAutoDropShortEmpty: ((_ duration: Double, _ transcript: String) -> Bool)?
+
     private var queue: [Recording] = []
     private var worker: Task<Void, Never>?
 
@@ -197,12 +208,22 @@ final class TranscriptionService: ObservableObject {
 
     // MARK: - Public API
 
+    /// IDs enqueued as a manual re-transcribe. Consumed by `process` to make
+    /// the issue-#61 auto-drop gate an *explicit* first-transcription check
+    /// rather than one inferred from an empty transcript — a recording that
+    /// previously failed empty also has empty `fullText`, so inference alone
+    /// could hard-delete it (plus its audio) on a deliberate retry.
+    private var retranscriptionIDs: Set<UUID> = []
+
     /// Enqueue a recording for transcription. Returns immediately.
     /// Calls don't overlap — the queue drains FIFO on a single background task.
     /// Idempotent: re-enqueuing the active or already-queued recording is a no-op.
-    func enqueue(_ recording: Recording) {
+    /// `isRetranscription` marks a deliberate re-run of an existing recording so
+    /// the auto-drop gate never discards it (see `retranscriptionIDs`).
+    func enqueue(_ recording: Recording, isRetranscription: Bool = false) {
         if activeRecordingID == recording.id { return }
         if queue.contains(where: { $0.id == recording.id }) { return }
+        if isRetranscription { retranscriptionIDs.insert(recording.id) }
         queue.append(recording)
         publishPending()
         startWorkerIfNeeded()
@@ -473,6 +494,17 @@ final class TranscriptionService: ObservableObject {
         // the wrong model for the language actually transcribed.
         // (The recording may also have been edited or soft-deleted in the gap.)
         var working = store.recordings.first(where: { $0.id == recording.id }) ?? recording
+        // Whether this is the recording's FIRST transcription — the only case
+        // the issue-#61 auto-drop gate may discard a recording. A manual
+        // re-transcribe must NEVER be dropped even if it comes back empty
+        // (that would delete an existing recording + its audio). Use the
+        // explicit `enqueue(isRetranscription:)` flag (consumed here), AND
+        // require an empty prior `fullText`, so neither a UI retry of a
+        // previously-failed-empty recording nor a recovered re-run is dropped.
+        // Captured before `fullText` is overwritten below. See issue #61 review.
+        let wasRetranscribeEnqueue = retranscriptionIDs.remove(recording.id) != nil
+        let isFirstTranscription = !wasRetranscribeEnqueue
+            && working.fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if working.isTrashed {
             print("Transcribe skipped: \(working.title) was deleted before processing")
             return
@@ -591,6 +623,11 @@ final class TranscriptionService: ObservableObject {
                 working.status = .failed
                 working.fullText = ""
                 working.segments = []
+                // Auto-drop accidental short+empty captures (issue #61) before
+                // we persist the .failed row: a sub-threshold clip with no
+                // transcribable audio is pure list spam. A long-but-silent clip
+                // is over the threshold, so the gate keeps it as .failed.
+                if autoDropIfShortAndEmpty(working, duration: durationSeconds, transcript: "", isFirstTranscription: isFirstTranscription) { return }
                 store.update(working)
                 return
             }
@@ -693,6 +730,13 @@ final class TranscriptionService: ObservableObject {
                 working.duration = lastEnd
             }
             working.status = text.isEmpty ? .failed : .completed
+            // Auto-drop accidental short+empty captures (issue #61): a clip
+            // that came back with NO transcript AND is under the user's
+            // minimum-duration threshold is a hotkey misfire / silence — drop
+            // it instead of leaving a .failed row cluttering the list. The gate
+            // keeps any clip that produced text (even a short one) and anything
+            // at/over the threshold, so this only ever removes worthless rows.
+            if autoDropIfShortAndEmpty(working, duration: durationSeconds, transcript: text, isFirstTranscription: isFirstTranscription) { return }
             store.update(working)
 
             if working.status == .completed {
@@ -753,6 +797,34 @@ final class TranscriptionService: ObservableObject {
             working.status = .failed
             store.update(working)
         }
+    }
+
+    /// Permanently delete `recording` when the auto-drop gate flags it as an
+    /// accidental short+empty capture (issue #61). Returns `true` if it
+    /// dropped it (the caller should then early-return without persisting a
+    /// `.failed`/`.completed` row). We hard-delete rather than soft-delete:
+    /// these clips have no transcript and no audio worth keeping, so routing
+    /// them through Recently Deleted would just leave orphaned audio on disk
+    /// for the grace period. No-op when the gate isn't wired (tests) or the
+    /// recording has real content / is long enough to keep.
+    private func autoDropIfShortAndEmpty(_ recording: Recording, duration: Double, transcript: String, isFirstTranscription: Bool) -> Bool {
+        // Only auto-drop a recording's FIRST transcription. A manual
+        // re-transcribe of an existing recording that comes back empty must
+        // NOT be deleted — that would destroy content the user already had.
+        guard isFirstTranscription else { return false }
+        // Only auto-drop accidental *local mic captures* (mic recordings +
+        // dictation hotkey misfires — both `.microphone`). Never Voice Memos,
+        // imported files (`.systemAudio`), or meeting captures: those aren't
+        // accidental and/or their source audio wasn't captured in Mila, so
+        // permanently deleting them would be data loss (issue #61 review).
+        guard recording.source == .microphone else { return false }
+        // Use the freshly-decoded audio duration, NOT `recording.duration`,
+        // which can be stale (crash-recovered rows are seeded with 0) and
+        // would let a long-but-silent clip slip under the threshold.
+        guard shouldAutoDropShortEmpty?(duration, transcript) == true else { return false }
+        print("Transcribe: auto-dropping \(recording.title) [\(recording.id.uuidString.prefix(8))] — \(duration)s + empty transcript (issue #61)")
+        store.permanentlyDelete(recording)
+        return true
     }
 }
 

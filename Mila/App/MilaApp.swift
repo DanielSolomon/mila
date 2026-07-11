@@ -421,6 +421,15 @@ struct MilaApp: App {
                 summarizer?.summarizeIfNeeded(rec)
             }
         }
+        // Auto-drop accidental short+empty captures (issue #61). A recording
+        // that finishes transcription with no text AND under the user's
+        // minimum-duration threshold (Settings ▸ Storage, default 5s, 0 = keep
+        // all) is a hotkey misfire / silence clip — permanently drop it so it
+        // never spams the list. Reads the live threshold each time so a
+        // Settings change takes effect on the next recording without relaunch.
+        svc.shouldAutoDropShortEmpty = { [weak storage] duration, transcript in
+            storage?.shouldAutoDrop(duration: duration, transcript: transcript) ?? false
+        }
         // Late-bind the live-AI dependencies onto `actions` so it can
         // attach summary/items to the saved Recording and skip the
         // rename sheet when Live AI was running.
@@ -1330,7 +1339,12 @@ struct MilaApp: App {
             }
         }
         store.updateAll(statusChanged)          // single persist for the whole sweep
-        toEnqueue.forEach(transcription.enqueue)
+        // Recovered rows are re-runs of transcriptions that were already
+        // in flight before the app quit — never a fresh capture. Mark them
+        // as re-transcriptions so the issue-#61 auto-drop gate can't delete
+        // one (e.g. a mid-retranscribe of an empty-transcript recording that
+        // crashed) just because the recovered rerun comes back short + empty.
+        toEnqueue.forEach { transcription.enqueue($0, isRetranscription: true) }
 
         // 2. Auto-enqueue recovered orphans.
         let ids = store.consumePendingRecoveryIDs()
