@@ -16,9 +16,21 @@ import Accelerate
 /// feed and the saved WAV (single source of truth).
 ///
 /// ## Behaviour
-/// - **Update gate**: gain only adapts on frames whose RMS exceeds the VAD
-///   noise floor. Pure silence is passed through at the last-known gain so
-///   the noise floor never gets amplified into garbage.
+/// - **Update gate**: gain only adapts on frames whose RMS clearly exceeds
+///   the *observed* room noise floor (a minimum-statistics tracker: seeded
+///   from the first frame, snaps down to any quieter frame, drifts slowly
+///   upward). Quiet-but-real speech — bursty, with pauses that keep the
+///   floor pinned at room tone — adapts; sustained hum becomes its own
+///   floor and gates itself off, so it is never amplified into the VAD's
+///   trigger range. Pure silence is passed through at the last-known gain
+///   so the noise floor never gets amplified into garbage.
+///
+///   The gate was previously a static 0.012 — the same value as the live
+///   VAD's speech cutoff — which made the controller useless in exactly
+///   the scenario it was built for: speech quieter than 0.012 never
+///   adapted the gain, so it stayed below the VAD cutoff forever and the
+///   live transcript sat empty for the whole recording (observed on a
+///   MacBook Pro built-in mic at ~0.004-0.010 RMS speech).
 /// - **Attack** (signal louder than target, gain too high): ~200 ms time
 ///   constant — fast enough to prevent clipping on sudden voice onsets.
 /// - **Release** (signal quieter than target, gain too low): ~2 s time
@@ -47,11 +59,23 @@ final class AdaptiveGainController: @unchecked Sendable {
     /// Minimum gain. 1.0 means "never attenuate" — a loud speaker passes
     /// through unchanged.
     static let defaultMinGain: Float = 1.0
-    /// Threshold below which we treat the frame as silence and *hold* the
-    /// last gain instead of adapting. Matches the live VAD's static cutoff
-    /// (`UtteranceDetector.rmsThreshold`) so we adapt on the same frames
-    /// the VAD treats as speech.
-    static let defaultSilenceFloor: Float = 0.012
+    /// Absolute minimum RMS below which a frame can never adapt the gain,
+    /// regardless of how quiet the observed noise floor is. Keeps a dead-
+    /// silent room (floor ≈ 0) from letting sub-audible rumble adapt.
+    /// Deliberately far below the VAD cutoff (0.012): frames between the
+    /// two are exactly the quiet speech this controller exists to boost.
+    static let defaultSilenceFloor: Float = 0.002
+    /// The adaptation gate is `max(silenceFloor, noiseFloor × this)`. 6×
+    /// sits between room tone (the floor itself) and quiet speech
+    /// (typically ≥ 10× the floor) — hum near the floor holds the gain,
+    /// speech adapts it.
+    static let defaultNoiseFloorMultiplier: Float = 6.0
+    /// Upward drift of the minimum-statistics noise floor: it doubles
+    /// once per this many seconds unless a quieter frame snaps it back
+    /// down. Fast enough that steady hum becomes its own floor within a
+    /// recording's first minute, slow enough that a long monologue
+    /// (pauses keep snapping the floor down) never out-drifts speech.
+    static let defaultNoiseFloorDoublingSeconds: Double = 20.0
     /// Attack time-constant in seconds. ~200 ms — fast enough to bring the
     /// gain back down when speech turns out louder than expected.
     static let defaultAttackSeconds: Double = 0.2
@@ -67,6 +91,8 @@ final class AdaptiveGainController: @unchecked Sendable {
     let maxGain: Float
     let minGain: Float
     let silenceFloor: Float
+    let noiseFloorMultiplier: Float
+    let noiseFloorDoublingSeconds: Double
     let attackSeconds: Double
     let releaseSeconds: Double
     let softClipThreshold: Float
@@ -76,6 +102,12 @@ final class AdaptiveGainController: @unchecked Sendable {
     /// safe to read from another thread for display because Swift `Float`
     /// loads/stores are atomic and we tolerate one-frame staleness.
     private(set) var currentGain: Float = 1.0
+    /// Minimum-statistics estimate of the room's background RMS. Negative
+    /// sentinel = "no frame seen yet"; seeded from the first frame so a
+    /// recording that starts inside steady hum treats that hum as floor
+    /// from sample one (rather than boosting it while a low initial guess
+    /// catches up). Read-only outside for tests/diagnostics.
+    private(set) var observedNoiseFloor: Float = -1
     /// `false` disables all adaptation and bypasses the soft clipper —
     /// output equals input bit-for-bit. Settings toggle.
     var enabled: Bool
@@ -86,6 +118,8 @@ final class AdaptiveGainController: @unchecked Sendable {
         maxGain: Float = defaultMaxGain,
         minGain: Float = defaultMinGain,
         silenceFloor: Float = defaultSilenceFloor,
+        noiseFloorMultiplier: Float = defaultNoiseFloorMultiplier,
+        noiseFloorDoublingSeconds: Double = defaultNoiseFloorDoublingSeconds,
         attackSeconds: Double = defaultAttackSeconds,
         releaseSeconds: Double = defaultReleaseSeconds,
         softClipThreshold: Float = defaultSoftClipThreshold,
@@ -96,6 +130,8 @@ final class AdaptiveGainController: @unchecked Sendable {
         self.maxGain = maxGain
         self.minGain = minGain
         self.silenceFloor = silenceFloor
+        self.noiseFloorMultiplier = noiseFloorMultiplier
+        self.noiseFloorDoublingSeconds = noiseFloorDoublingSeconds
         self.attackSeconds = attackSeconds
         self.releaseSeconds = releaseSeconds
         self.softClipThreshold = softClipThreshold
@@ -106,6 +142,7 @@ final class AdaptiveGainController: @unchecked Sendable {
     /// gain doesn't begin where the previous session left off.
     func reset() {
         currentGain = 1.0
+        observedNoiseFloor = -1
     }
 
     /// Apply gain in-place to a mono Float32 channel buffer. Computes the
@@ -130,11 +167,27 @@ final class AdaptiveGainController: @unchecked Sendable {
         //    keeps this safe to call on the audio render thread).
         var rms: Float = 0
         vDSP_rmsqv(samples, 1, &rms, vDSP_Length(count))
+        let frameDuration = Double(count) / sampleRate
 
-        // 2) Adapt the gain only when there's signal — never amplify pure
-        //    room hum. If the frame is below the silence floor, hold the
-        //    last gain and skip straight to applying it.
-        if rms >= silenceFloor {
+        // 2) Track the room's noise floor (minimum statistics): follow the
+        //    quietest recent frame, drifting slowly upward so a signal
+        //    that never pauses — hum, fan, AC — becomes its own floor.
+        //    Speech always has inter-word gaps that snap the floor back
+        //    down to true room tone, so it keeps clearing the gate.
+        let clampedRMS = max(rms, 1e-6)
+        if observedNoiseFloor < 0 {
+            observedNoiseFloor = clampedRMS
+        } else {
+            let drift = Float(exp2(frameDuration / max(noiseFloorDoublingSeconds, 1e-3)))
+            observedNoiseFloor = min(clampedRMS, observedNoiseFloor * drift)
+        }
+
+        // 3) Adapt the gain only when the frame is clearly above the
+        //    observed floor — never amplify room hum toward the VAD's
+        //    trigger range. Below the gate, hold the last gain and skip
+        //    straight to applying it.
+        let adaptGate = max(silenceFloor, observedNoiseFloor * noiseFloorMultiplier)
+        if rms >= adaptGate {
             let desired = clamp(targetRMS / max(rms, 1e-6),
                                 lower: minGain,
                                 upper: maxGain)
@@ -142,7 +195,6 @@ final class AdaptiveGainController: @unchecked Sendable {
             // (desired > currentGain, signal too quiet). Convert the
             // time-constant into a 0…1 blend factor using the frame's
             // wall-clock duration: alpha = 1 - exp(-dt / tau).
-            let frameDuration = Double(count) / sampleRate
             let tau = (desired < currentGain) ? attackSeconds : releaseSeconds
             let alpha = Float(1.0 - exp(-frameDuration / max(tau, 1e-6)))
             currentGain += (desired - currentGain) * alpha
@@ -152,14 +204,14 @@ final class AdaptiveGainController: @unchecked Sendable {
             currentGain = clamp(currentGain, lower: minGain, upper: maxGain)
         }
 
-        // 3) Apply the gain. With min=1, gain==1 is a no-op so skip the
+        // 4) Apply the gain. With min=1, gain==1 is a no-op so skip the
         //    multiply (most loud-speaker frames hit this path).
         let g = currentGain
         if g != 1.0 {
             vDSP_vsmul(samples, 1, [g], samples, 1, vDSP_Length(count))
         }
 
-        // 4) Soft-clip any sample whose magnitude exceeds the threshold.
+        // 5) Soft-clip any sample whose magnitude exceeds the threshold.
         //    The bulk of speech frames won't trigger this; we pay the loop
         //    only on the few transients that need protection.
         let threshold = softClipThreshold
