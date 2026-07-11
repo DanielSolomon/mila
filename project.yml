@@ -17,7 +17,14 @@ settings:
     SWIFT_STRICT_CONCURRENCY: minimal
     GENERATE_INFOPLIST_FILE: NO
     PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisper
-    MARKETING_VERSION: "1.8.14"
+    MARKETING_VERSION: "1.9.0-beta.1"
+    # 1.9.0-beta.1:
+    #   * First beta on the new opt-in beta channel. Everything merged since
+    #     1.8.14: remote transcription backend, iPhone Voice Memos sync
+    #     (scoped folder access, no Full Disk Access), neural VAD, LLM
+    #     auto-summary + test panel, queue Stop/Remove, auto-drop accidental
+    #     clips, dictation-overlay fix, and a large bug-fix sweep. See
+    #     RELEASE_NOTES/v1.9.0-beta.1.md.
     # 1.8.14:
     #   * Live AI: guarantee a fresh Claude session per recording so a new
     #     recording's summary / action items can never inherit a previous
@@ -81,7 +88,7 @@ settings:
     #     labels at stop time so the final utterance gets its
     #     speaker label before saving (4 race fixes from Bugbot
     #     review). Still writes the .srt sidecar.
-    CURRENT_PROJECT_VERSION: "51"
+    CURRENT_PROJECT_VERSION: "52"
 
 packages:
   TranscriptionCore:
