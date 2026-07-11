@@ -704,7 +704,7 @@ final class QuickActionsController: ObservableObject {
         // Snapshot final state. Safe to read now because `.idle`
         // handler is skipping its `transcriber.stop()` /
         // `diarizer.stop()` while `isFinalizingRecording` is true.
-        let finalLiveSegments = liveTranscriber?.segments ?? []
+        let finalTranscriptSegments = liveTranscriber?.transcriptSegments ?? []
         let finalSummary = (liveAISession?.summary ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let finalItems = liveAISession?.actionItems ?? []
@@ -750,12 +750,8 @@ final class QuickActionsController: ObservableObject {
         //
         // `vadActive` here is whatever was passed in by the caller —
         // typically `liveAISettings.useVAD && liveAISettings.enabled`.
-        let hasLiveSegments = !finalLiveSegments.isEmpty
+        let hasLiveSegments = !finalTranscriptSegments.isEmpty
         let liveTranscriptIsAuthoritative = hasLiveSegments && vadActive
-        let finalTranscriptSegments: [TranscriptSegment] = finalLiveSegments.map { ls in
-            TranscriptSegment(start: ls.startSeconds, end: ls.endSeconds,
-                              text: ls.text, speaker: ls.speaker)
-        }
         let finalFullText = finalTranscriptSegments.map(\.text).joined(separator: " ")
 
         guard var updated = store.recordings.first(where: { $0.id == recording.id }) else {

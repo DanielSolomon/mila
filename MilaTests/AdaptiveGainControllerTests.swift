@@ -131,6 +131,27 @@ final class AdaptiveGainControllerTests: XCTestCase {
                        "sustained hum must never adapt the gain (observed floor \(controller.observedNoiseFloor))")
     }
 
+    /// Hum that starts only AFTER a silent stretch (AC kicking in
+    /// mid-recording) briefly clears the gate while the noise floor —
+    /// seeded near zero by the silence — catches up, picking up gain.
+    /// The floor must find the hum within seconds, and the
+    /// sustained-noise relaxation must then unwind the acquired gain so
+    /// the boosted hum ends up back below the VAD's 0.012 trigger
+    /// instead of latching the live transcript into noise "utterances".
+    func test_humAfterSilence_gainRelaxesBackDown() {
+        let controller = AdaptiveGainController()
+        let silence = [Float](repeating: 0, count: 480)   // 30 ms @ 16 kHz
+        _ = drive(controller, chunk: silence, seconds: 5.0)
+
+        let hum = sine(amplitude: 0.008 * sqrt(2), durationSeconds: 0.030)
+        let final = drive(controller, chunk: hum, seconds: 90.0)
+
+        XCTAssertLessThan(controller.currentGain, 1.5,
+                          "gain acquired during the hum onset must relax back down")
+        XCTAssertLessThan(rms(final), 0.012,
+                          "steady hum must not stay boosted into the VAD's trigger range")
+    }
+
     /// A full-scale signal should be passed through at gain == 1 —
     /// never attenuate, and never soft-clip a signal that's already at or
     /// below the soft-clip threshold.
