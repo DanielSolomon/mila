@@ -199,13 +199,15 @@ final class AdaptiveGainController: @unchecked Sendable {
     }
 
     /// Apply gain in-place to a mono Float32 channel buffer. Computes the
-    /// frame's RMS, updates the smoothed gain (if signal is above the
-    /// silence floor), and writes the gained + soft-clipped samples back
-    /// into `samples`.
+    /// frame's RMS, updates the windowed-minimum noise floor and the
+    /// adaptation gate derived from it, updates the smoothed gain (adapting
+    /// toward target when the gate is cleared, relaxing back toward 1
+    /// after sustained below-gate noise, holding through everything else),
+    /// and writes the gained + soft-clipped samples back into `samples`.
     ///
-    /// `frameDurationSeconds` is the elapsed wall-clock time the frame
-    /// represents; used to convert the attack/release time-constants into
-    /// per-frame smoothing coefficients. For a 30 ms frame this is `0.030`.
+    /// The frame's wall-clock duration — `count / sampleRate` — converts
+    /// the floor-window/attack/release/relax time-constants into per-frame
+    /// smoothing coefficients. For a 30 ms frame this is `0.030`.
     func process(_ samples: UnsafeMutablePointer<Float>, count: Int) {
         guard count > 0 else { return }
         if !enabled {
