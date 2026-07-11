@@ -66,8 +66,12 @@ These patches live in `SpeakerDiarizer.swift`'s inline diarize script. If upgrad
   literals there.
 - Tags are `v`-prefixed: `v1.2.8`. `CURRENT_PROJECT_VERSION` (the build
   number) must increase monotonically — Sparkle keys updates on it.
-- A local, unsigned DMG for testing: `make dmg` (ad-hoc signed; Gatekeeper
-  shows the right-click → Open prompt on first launch).
+- A local DMG for testing: `make dmg`. It signs with the persistent
+  "Mila Local Dev" cert when that cert exists in the login keychain (created
+  by `scripts/install-debug.sh`; keeps TCC mic/recording grants across
+  installs) and falls back to ad-hoc otherwise. To force an ad-hoc build —
+  e.g. to test the Gatekeeper right-click → Open first-launch prompt — run
+  `CODESIGN_IDENTITY=- make dmg`.
 - Notarized, signed release builds and Sparkle appcast publishing are produced
   by a separate, private signing pipeline maintained by the original authors;
   that toolchain is not part of this repository. Forks that want notarized

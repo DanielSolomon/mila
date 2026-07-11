@@ -53,6 +53,7 @@ make dmg VERSION="$VERSION"
 ## Verifying the signature
 
 A correct local build is signed with the Mila Local Dev cert (or ad-hoc if that cert was never created) and carries the app entitlements:
+
 ```bash
 codesign -dv /Applications/Mila.app 2>&1 | grep -E "Identifier|Signature|Authority"
 # Identifier=io.island.whisper.IslandWhisper
@@ -81,9 +82,13 @@ Ad-hoc-signed apps copied (not downloaded) have no quarantine flag, so they laun
 
 ```bash
 SHA=$(security find-certificate -c "Mila Local Dev" -a -Z \
-      ~/Library/Keychains/login.keychain-db | awk '/SHA-1 hash/ {print $NF}' | head -1)
-codesign --force --sign "$SHA" \
-  --entitlements Mila/Resources/Mila.entitlements /Applications/Mila.app
+      ~/Library/Keychains/login.keychain-db 2>/dev/null | awk '/SHA-1 hash/ {print $NF}' | head -1)
+if [ -z "$SHA" ]; then
+  echo "no 'Mila Local Dev' cert — run scripts/install-debug.sh once to create it" >&2
+else
+  codesign --force --sign "$SHA" \
+    --entitlements Mila/Resources/Mila.entitlements /Applications/Mila.app
+fi
 ```
 
 If the cert doesn't exist yet, run `scripts/install-debug.sh` once to create it (or accept ad-hoc + per-install re-prompts).
@@ -93,5 +98,5 @@ If the cert doesn't exist yet, run `scripts/install-debug.sh` once to create it 
 - **Running `make dmg` without `VERSION=`** → the `MARKETING_VERSION: command not found` failure above. Always pass it.
 - **Editing `Mila.xcodeproj` directly** → overwritten on next `make project`. Edit `project.yml` instead.
 - **Hardcoding a version in `Info.plist`** → it must stay `$(MARKETING_VERSION)` / `$(CURRENT_PROJECT_VERSION)`; bump versions only in `project.yml`.
-- **Expecting a Developer-ID / notarized build** → not available locally; this repo only ad-hoc signs.
+- **Expecting a Developer-ID / notarized build** → not available locally; local builds sign with the Mila Local Dev cert or ad-hoc. (`CODESIGN_IDENTITY=- make dmg` forces ad-hoc, e.g. to test the Gatekeeper first-launch prompt.)
 - **`rm`-ing an old `/Applications/Mila.app`** → use `trash` so it's recoverable.

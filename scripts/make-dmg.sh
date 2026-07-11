@@ -9,8 +9,9 @@
 # login keychain (created by scripts/install-debug.sh — keeps TCC mic/screen
 # grants across installs), else ad-hoc. Ad-hoc-signed apps get the Gatekeeper
 # right-click → Open prompt on first launch and lose TCC grants on every
-# reinstall. Re-sign with `codesign -s "Developer ID Application: ..."` before
-# distributing externally.
+# reinstall; pass CODESIGN_IDENTITY=- to force ad-hoc (e.g. to test that
+# Gatekeeper first-launch path). Re-sign with
+# `codesign -s "Developer ID Application: ..."` before distributing externally.
 
 set -euo pipefail
 
@@ -47,9 +48,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENTITLEMENTS="$SCRIPT_DIR/../Mila/Resources/Mila.entitlements"
 
 if [[ -z "${CODESIGN_IDENTITY:-}" ]]; then
-    LOCAL_DEV_SHA=$(security find-certificate -c "Mila Local Dev" -a -Z \
+    LOCAL_DEV_SHAS=$(security find-certificate -c "Mila Local Dev" -a -Z \
         "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null \
-        | awk '/SHA-1 hash/ {print $NF}' | head -1 || true)
+        | awk '/SHA-1 hash/ {print $NF}' || true)
+    if [[ $(grep -c . <<<"$LOCAL_DEV_SHAS") -gt 1 ]]; then
+        echo "warning: multiple 'Mila Local Dev' certs in login keychain; using the first —" >&2
+        echo "         if TCC still re-prompts, delete the stale duplicates and re-sign." >&2
+    fi
+    LOCAL_DEV_SHA=$(head -1 <<<"$LOCAL_DEV_SHAS")
     if [[ -n "$LOCAL_DEV_SHA" ]]; then
         echo "signing with Mila Local Dev cert ($LOCAL_DEV_SHA)" >&2
         CODESIGN_IDENTITY="$LOCAL_DEV_SHA"
