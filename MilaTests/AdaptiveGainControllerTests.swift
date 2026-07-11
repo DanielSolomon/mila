@@ -55,13 +55,14 @@ final class AdaptiveGainControllerTests: XCTestCase {
                              bursts: Int,
                              voicedSeconds: Double = 1.0,
                              gapSeconds: Double = 0.5,
+                             gapChunk: [Float]? = nil,
                              sampleRate: Double = 16_000) -> [Float] {
-        let silence = [Float](repeating: 0, count: chunk.count)
+        let gap = gapChunk ?? [Float](repeating: 0, count: chunk.count)
         var lastVoiced: [Float] = []
         for _ in 0..<bursts {
             lastVoiced = drive(controller, chunk: chunk,
                                seconds: voicedSeconds, sampleRate: sampleRate)
-            _ = drive(controller, chunk: silence,
+            _ = drive(controller, chunk: gap,
                       seconds: gapSeconds, sampleRate: sampleRate)
         }
         return lastVoiced
@@ -129,6 +130,26 @@ final class AdaptiveGainControllerTests: XCTestCase {
 
         XCTAssertEqual(controller.currentGain, 1.0, accuracy: 1e-3,
                        "sustained hum must never adapt the gain (observed floor \(controller.observedNoiseFloor))")
+    }
+
+    /// Field regression for the windowed-minimum floor: quiet speech over
+    /// REAL room tone (~0.001 RMS between utterances — not digital
+    /// zeros). An earlier EMA-based floor rose toward the average signal,
+    /// settled above room tone, and parked the adaptation gate on top of
+    /// the speech itself — live transcription silently died in any room
+    /// with elevated tone. The windowed minimum must keep the floor at
+    /// the tone's minimum so speech keeps clearing the gate.
+    func test_quietSpeech_overRealRoomTone_getsAmplified() {
+        let controller = AdaptiveGainController()
+        let speech = sine(amplitude: 0.006 * sqrt(2), durationSeconds: 0.030)
+        let roomTone = sine(amplitude: 0.001 * sqrt(2), durationSeconds: 0.030)
+        let final = driveBursts(controller, chunk: speech, bursts: 8,
+                                gapChunk: roomTone)
+
+        XCTAssertGreaterThan(controller.currentGain, 2.0,
+                             "quiet speech over real room tone must adapt the gain (floor \(controller.observedNoiseFloor))")
+        XCTAssertGreaterThan(rms(final), 0.012,
+                             "boosted speech must clear the live VAD cutoff (0.012)")
     }
 
     /// Hum that starts only AFTER a silent stretch (AC kicking in

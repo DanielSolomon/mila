@@ -17,14 +17,18 @@ import Accelerate
 ///
 /// ## Behaviour
 /// - **Update gate**: gain only adapts on frames whose RMS clearly exceeds
-///   the *observed* room noise floor (seeded from the first frame, snaps
-///   down to any quieter frame, rises toward louder sustained signal with
-///   a ~10 s time constant). Quiet-but-real speech — bursty, with pauses
-///   that keep the floor pinned at room tone — adapts; sustained hum
-///   becomes its own floor within seconds and gates itself off, so it is
-///   never amplified into the VAD's trigger range. Pure silence is passed
-///   through at the last-known gain so the noise floor never gets
-///   amplified into garbage.
+///   the *observed* room noise floor — the MINIMUM frame RMS over the
+///   last `noiseFloorWindowSeconds` (two half-window buckets, classic
+///   minimum statistics). The minimum is the right statistic: speech
+///   pauses within any window pin the floor at true room tone no matter
+///   how loud or continuous the talking is, so quiet speech keeps
+///   clearing the gate — while sustained hum, which never pauses, becomes
+///   the window minimum within one window and gates itself off. (An
+///   earlier EMA-toward-signal variant regressed the quiet-mic fix: in a
+///   room with elevated tone it settled at the AVERAGE level and parked
+///   the gate on top of quiet speech.) Pure silence is passed through at
+///   the last-known gain so the noise floor never gets amplified into
+///   garbage.
 ///
 ///   The gate was previously a static 0.012 — the same value as the live
 ///   VAD's speech cutoff — which made the controller useless in exactly
@@ -75,20 +79,19 @@ final class AdaptiveGainController: @unchecked Sendable {
     /// Deliberately far below the VAD cutoff (0.012): frames between the
     /// two are exactly the quiet speech this controller exists to boost.
     static let defaultSilenceFloor: Float = 0.002
-    /// The adaptation gate is `max(silenceFloor, noiseFloor × this)`. 6×
-    /// sits between room tone (the floor itself) and quiet speech
-    /// (typically ≥ 10× the floor) — hum near the floor holds the gain,
-    /// speech adapts it.
-    static let defaultNoiseFloorMultiplier: Float = 6.0
-    /// Time constant of the noise floor's rise toward louder sustained
-    /// signal (exponential approach; downward snaps are instant). 10 s
-    /// finds a hum that starts after a silent stretch within ~2 s (the
-    /// gate needs floor ≥ hum/multiplier, i.e. ~1/6 of the way up),
-    /// while a burst of speech between pauses only drags the floor a
-    /// fraction of the way up before the next pause snaps it back down.
-    /// The previous doubling-based drift took minutes to climb from a
-    /// silence-seeded floor to a real hum level.
-    static let defaultNoiseFloorRiseSeconds: Double = 10.0
+    /// The adaptation gate is `max(silenceFloor, noiseFloor × this)`. 4×
+    /// sits between room tone (the floor itself, fluctuating up to ~2-3×
+    /// its own minimum) and quiet speech (≥ 5-10× the floor) — hum near
+    /// the floor holds the gain, speech adapts it. Observed field values
+    /// that must stay separated: room-tone minimum ~0.0005-0.0015 on a
+    /// MacBook Pro built-in mic vs quiet-speech frames ~0.004-0.010.
+    static let defaultNoiseFloorMultiplier: Float = 4.0
+    /// Length of the minimum-statistics window. Hum that starts after a
+    /// silent stretch owns the floor once the window has fully rotated
+    /// past the silence — ≤ 12 s — bounding how long its onset can keep
+    /// adapting the gain. Conversation always pauses within any 12 s
+    /// span, so speech never becomes its own floor.
+    static let defaultNoiseFloorWindowSeconds: Double = 12.0
     /// How long the signal must sit continuously below the adaptation
     /// gate (but above dead silence) before the gain starts relaxing
     /// back toward 1. Longer than any conversational pause or single
@@ -118,7 +121,7 @@ final class AdaptiveGainController: @unchecked Sendable {
     let minGain: Float
     let silenceFloor: Float
     let noiseFloorMultiplier: Float
-    let noiseFloorRiseSeconds: Double
+    let noiseFloorWindowSeconds: Double
     let noiseRelaxAfterSeconds: Double
     let noiseRelaxSeconds: Double
     let deadSilenceFloor: Float
@@ -131,12 +134,19 @@ final class AdaptiveGainController: @unchecked Sendable {
     /// safe to read from another thread for display because Swift `Float`
     /// loads/stores are atomic and we tolerate one-frame staleness.
     private(set) var currentGain: Float = 1.0
-    /// Minimum-statistics estimate of the room's background RMS. Negative
-    /// sentinel = "no frame seen yet"; seeded from the first frame so a
-    /// recording that starts inside steady hum treats that hum as floor
-    /// from sample one (rather than boosting it while a low initial guess
-    /// catches up). Read-only outside for tests/diagnostics.
+    /// Minimum-statistics estimate of the room's background RMS: the
+    /// minimum frame RMS over the last `noiseFloorWindowSeconds`, via two
+    /// half-window buckets. Negative sentinel = "no frame seen yet";
+    /// seeded from the first frame so a recording that starts inside
+    /// steady hum treats that hum as floor from sample one. Read-only
+    /// outside for tests/diagnostics.
     private(set) var observedNoiseFloor: Float = -1
+    /// Current and previous half-window minimum buckets backing
+    /// `observedNoiseFloor`, plus how much of the current half-window
+    /// has elapsed. `.infinity` = bucket empty.
+    private var windowMin: Float = .infinity
+    private var prevWindowMin: Float = .infinity
+    private var windowElapsed: Double = 0
     /// Seconds of *continuous* below-gate, above-dead-silence signal seen
     /// so far. Crossing `noiseRelaxAfterSeconds` engages the gain
     /// relaxation; any speech frame or dead-silence frame resets it.
@@ -152,7 +162,7 @@ final class AdaptiveGainController: @unchecked Sendable {
         minGain: Float = defaultMinGain,
         silenceFloor: Float = defaultSilenceFloor,
         noiseFloorMultiplier: Float = defaultNoiseFloorMultiplier,
-        noiseFloorRiseSeconds: Double = defaultNoiseFloorRiseSeconds,
+        noiseFloorWindowSeconds: Double = defaultNoiseFloorWindowSeconds,
         noiseRelaxAfterSeconds: Double = defaultNoiseRelaxAfterSeconds,
         noiseRelaxSeconds: Double = defaultNoiseRelaxSeconds,
         deadSilenceFloor: Float = defaultDeadSilenceFloor,
@@ -167,7 +177,7 @@ final class AdaptiveGainController: @unchecked Sendable {
         self.minGain = minGain
         self.silenceFloor = silenceFloor
         self.noiseFloorMultiplier = noiseFloorMultiplier
-        self.noiseFloorRiseSeconds = noiseFloorRiseSeconds
+        self.noiseFloorWindowSeconds = noiseFloorWindowSeconds
         self.noiseRelaxAfterSeconds = noiseRelaxAfterSeconds
         self.noiseRelaxSeconds = noiseRelaxSeconds
         self.deadSilenceFloor = deadSilenceFloor
@@ -182,6 +192,9 @@ final class AdaptiveGainController: @unchecked Sendable {
     func reset() {
         currentGain = 1.0
         observedNoiseFloor = -1
+        windowMin = .infinity
+        prevWindowMin = .infinity
+        windowElapsed = 0
         sustainedNoiseSeconds = 0
     }
 
@@ -209,22 +222,25 @@ final class AdaptiveGainController: @unchecked Sendable {
         vDSP_rmsqv(samples, 1, &rms, vDSP_Length(count))
         let frameDuration = Double(count) / sampleRate
 
-        // 2) Track the room's noise floor: snap down instantly to any
-        //    quieter frame, rise toward louder sustained signal with a
-        //    ~10 s time constant. A signal that never pauses — hum, fan,
-        //    AC — becomes its own floor within seconds even after a
-        //    silent stretch seeded the floor near zero; speech's
-        //    inter-word gaps keep snapping the floor back down to true
-        //    room tone, so it keeps clearing the gate.
+        // 2) Track the room's noise floor as the MINIMUM frame RMS over
+        //    the last window (two half-window buckets). Speech pauses
+        //    within any window pin the floor at true room tone — the
+        //    floor must NOT follow the average signal (an earlier EMA
+        //    variant did, and in a room with elevated tone it parked
+        //    the gate on top of quiet speech). A signal that never
+        //    pauses — hum, fan, AC — owns the window minimum once the
+        //    window rotates past whatever preceded it, so a
+        //    mid-recording hum onset gates itself off within
+        //    `noiseFloorWindowSeconds`.
         let clampedRMS = max(rms, 1e-6)
-        if observedNoiseFloor < 0 {
-            observedNoiseFloor = clampedRMS
-        } else if clampedRMS < observedNoiseFloor {
-            observedNoiseFloor = clampedRMS
-        } else {
-            let alpha = Float(1.0 - exp(-frameDuration / max(noiseFloorRiseSeconds, 1e-3)))
-            observedNoiseFloor += (clampedRMS - observedNoiseFloor) * alpha
+        windowMin = min(windowMin, clampedRMS)
+        windowElapsed += frameDuration
+        if windowElapsed >= noiseFloorWindowSeconds / 2 {
+            prevWindowMin = windowMin
+            windowMin = clampedRMS
+            windowElapsed = 0
         }
+        observedNoiseFloor = min(windowMin, prevWindowMin)
 
         // 3) Adapt the gain only when the frame is clearly above the
         //    observed floor — never amplify room hum toward the VAD's
