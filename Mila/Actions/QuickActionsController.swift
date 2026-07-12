@@ -598,11 +598,7 @@ final class QuickActionsController: ObservableObject {
         // live pane. Now the dialog pops up instantly; the
         // background drain below updates the Recording (and thus
         // the sheet, which observes the store) as more data lands.
-        let initialSegments = liveTranscriber?.segments ?? []
-        let initialTranscriptSegments: [TranscriptSegment] = initialSegments.map { ls in
-            TranscriptSegment(start: ls.startSeconds, end: ls.endSeconds,
-                              text: ls.text, speaker: ls.speaker)
-        }
+        let initialTranscriptSegments = liveTranscriber?.transcriptSegments ?? []
         let initialSummary = (liveAISession?.summary ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let initialItems = liveAISession?.actionItems ?? []
@@ -613,7 +609,7 @@ final class QuickActionsController: ObservableObject {
         // the drain task. Mirrors `useLiveTranscript` below: both VAD
         // and chunk modes produce live segments we want to preserve,
         // so the initial-status gate is segment-presence, not mode.
-        let initialStatus: TranscriptionStatus = initialSegments.isEmpty ? .pending : .running
+        let initialStatus: TranscriptionStatus = initialTranscriptSegments.isEmpty ? .pending : .running
         let recording = Recording(
             title: title,
             duration: duration,
@@ -708,7 +704,7 @@ final class QuickActionsController: ObservableObject {
         // Snapshot final state. Safe to read now because `.idle`
         // handler is skipping its `transcriber.stop()` /
         // `diarizer.stop()` while `isFinalizingRecording` is true.
-        let finalLiveSegments = liveTranscriber?.segments ?? []
+        let finalTranscriptSegments = liveTranscriber?.transcriptSegments ?? []
         let finalSummary = (liveAISession?.summary ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let finalItems = liveAISession?.actionItems ?? []
@@ -754,12 +750,8 @@ final class QuickActionsController: ObservableObject {
         //
         // `vadActive` here is whatever was passed in by the caller —
         // typically `liveAISettings.useVAD && liveAISettings.enabled`.
-        let hasLiveSegments = !finalLiveSegments.isEmpty
+        let hasLiveSegments = !finalTranscriptSegments.isEmpty
         let liveTranscriptIsAuthoritative = hasLiveSegments && vadActive
-        let finalTranscriptSegments: [TranscriptSegment] = finalLiveSegments.map { ls in
-            TranscriptSegment(start: ls.startSeconds, end: ls.endSeconds,
-                              text: ls.text, speaker: ls.speaker)
-        }
         let finalFullText = finalTranscriptSegments.map(\.text).joined(separator: " ")
 
         guard var updated = store.recordings.first(where: { $0.id == recording.id }) else {
