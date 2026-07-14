@@ -339,7 +339,12 @@ struct RecordingDetailView: View {
                                        showSpeaker: hasSpeakers,
                                        useSpeakerColor: hasMultipleSpeakers,
                                        language: recording.language,
-                                       onTap: { seek(to: seg.start) })
+                                       speakerNames: recording.speakerNames,
+                                       onTap: { seek(to: seg.start) },
+                                       onAssignName: { raw, name in
+                                           store.setSpeakerName(name, forSpeaker: raw,
+                                                                recordingID: recording.id)
+                                       })
                         }
                     }
                     .padding()
@@ -411,7 +416,8 @@ struct RecordingDetailView: View {
 
     private func copyTranscript() {
         let text = TranscriptFormatter.plainText(segments: recording.segments,
-                                                 fallback: recording.fullText)
+                                                 fallback: recording.fullText,
+                                                 names: recording.speakerNames)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
     }
@@ -569,7 +575,12 @@ private struct SegmentRow: View {
     /// language — matching the labels the live view + post-recording
     /// action items already show.
     let language: String
+    /// User-assigned speaker names for this recording (raw ID → name).
+    let speakerNames: [String: String]
     let onTap: () -> Void
+    /// Persists a rename picked from the label's popover:
+    /// (raw speaker ID, chosen name or nil-to-reset).
+    let onAssignName: (String, String?) -> Void
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -578,10 +589,15 @@ private struct SegmentRow: View {
             // label "Speaker A" / "דובר א׳" and the actual content.
             // `fixedSize` keeps the label at its natural width.
             if showSpeaker, let raw = segment.speaker, !raw.isEmpty {
-                Text(raw.friendlySpeakerLabel(language: language) + ":")
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(useSpeakerColor ? raw.speakerColor : Color.accentColor)
-                    .fixedSize(horizontal: true, vertical: false)
+                SpeakerLabelButton(
+                    rawID: raw,
+                    names: speakerNames,
+                    language: language,
+                    color: useSpeakerColor ? raw.speakerColor(names: speakerNames) : Color.accentColor,
+                    suffix: ":",
+                    onAssign: { name in onAssignName(raw, name) }
+                )
+                .fixedSize(horizontal: true, vertical: false)
             }
             Text(segment.text)
                 .font(.body)

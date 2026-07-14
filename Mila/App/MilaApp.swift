@@ -249,6 +249,9 @@ struct MilaApp: App {
     @StateObject private var recordingSummarizer: RecordingSummarizer
     @StateObject private var voiceMemosSettings: VoiceMemosSettings
     @StateObject private var voiceMemosImporter: VoiceMemosImporter
+    /// Persistent, app-wide list of speaker names — the pick-list behind
+    /// the transcript's speaker rename popover.
+    @StateObject private var speakerDirectory = SpeakerDirectory()
     @StateObject private var updater = UpdaterViewModel()
 
     init() {
@@ -545,6 +548,7 @@ struct MilaApp: App {
                 .environmentObject(meetingDetectionSettings)
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
+                .environmentObject(speakerDirectory)
         }
         .commands {
             CommandGroup(after: .appInfo) {
@@ -598,6 +602,7 @@ struct MilaApp: App {
                 .environmentObject(liveAISettings)
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
+                .environmentObject(speakerDirectory)
         }
     }
 

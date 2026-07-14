@@ -725,6 +725,12 @@ final class TranscriptionService: ObservableObject {
             print("Transcribe done: \(working.title) -> \(enrichedSegments.count) segments, \(text.count) chars")
 
             working.segments = enrichedSegments
+            // The batch pass minted fresh speaker IDs (new clustering, new
+            // segment boundaries) with no alignment to the old ones, so any
+            // user-assigned names are now keyed to meaningless IDs — clear
+            // them rather than mislabel a different voice. Only explicit
+            // re-transcribes of a renamed recording hit this in practice.
+            working.speakerNames = [:]
             working.fullText = text
             if let lastEnd = enrichedSegments.last?.end, lastEnd > 0 {
                 working.duration = lastEnd
