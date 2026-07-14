@@ -64,6 +64,45 @@ final class RecordingStoreTests: XCTestCase {
                       "Tombstones must persist across store instances")
     }
 
+    func test_setSpeakerName_sets_clears_and_persists() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "Meeting", source: .meeting,
+                            audioFileName: "meeting.wav",
+                            segments: [.init(start: 0, end: 1, text: "hi", speaker: "SPEAKER_00")])
+        store.add(rec)
+
+        store.setSpeakerName("  Daniel ", forSpeaker: "SPEAKER_00", recordingID: rec.id)
+        XCTAssertEqual(store.recordings.first?.speakerNames, ["SPEAKER_00": "Daniel"],
+                       "Name must be trimmed and stored keyed by the raw ID")
+
+        // Survives a relaunch via recordings.json.
+        let reloaded = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertEqual(reloaded.recordings.first?.speakerNames, ["SPEAKER_00": "Daniel"])
+
+        // nil (and empty/whitespace) clears the assignment.
+        reloaded.setSpeakerName(nil, forSpeaker: "SPEAKER_00", recordingID: rec.id)
+        XCTAssertEqual(reloaded.recordings.first?.speakerNames, [:])
+        reloaded.setSpeakerName("Noa", forSpeaker: "SPEAKER_00", recordingID: rec.id)
+        reloaded.setSpeakerName("   ", forSpeaker: "SPEAKER_00", recordingID: rec.id)
+        XCTAssertEqual(reloaded.recordings.first?.speakerNames, [:])
+    }
+
+    func test_setSpeakerName_regenerates_srt_sidecar_for_completed_recording() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "Meeting", source: .meeting,
+                            audioFileName: "meeting.wav",
+                            status: .completed,
+                            segments: [.init(start: 0, end: 1, text: "hi", speaker: "SPEAKER_00")])
+        store.add(rec)
+
+        store.setSpeakerName("Daniel", forSpeaker: "SPEAKER_00", recordingID: rec.id)
+
+        let srtURL = store.recordingsDirectory.appendingPathComponent("meeting.srt")
+        let srt = try String(contentsOf: srtURL, encoding: .utf8)
+        XCTAssertTrue(srt.contains("Daniel: hi"),
+                      "The on-disk .srt sidecar must be rewritten with the assigned name")
+    }
+
     func test_permanently_deleting_non_import_leaves_no_tombstone() {
         let store = RecordingStore(rootDirectory: tempRoot)
         let rec = Recording(title: "Mic recording", source: .microphone,

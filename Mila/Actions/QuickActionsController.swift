@@ -621,7 +621,8 @@ final class QuickActionsController: ObservableObject {
             fullText: initialTranscriptSegments.map(\.text).joined(separator: " "),
             appName: appName,
             summary: initialSummary.isEmpty ? nil : initialSummary,
-            actionItems: initialItems.isEmpty ? nil : initialItems
+            actionItems: initialItems.isEmpty ? nil : initialItems,
+            speakerNames: liveTranscriber?.speakerNames ?? [:]
         )
         store.add(recording)
         activeJob = .none
@@ -765,6 +766,11 @@ final class QuickActionsController: ObservableObject {
             return
         }
         updated.segments = finalTranscriptSegments
+        // Mid-recording speaker renames from the live pane. Snapshotted
+        // here (before `liveTranscriber?.stop()` below) alongside the
+        // segments they label; `finalizeTail` remaps them if the offline
+        // re-diarize pass re-keys the speaker IDs.
+        updated.speakerNames = liveTranscriber?.speakerNames ?? [:]
         // Always preserve fullText when we have live segments — the
         // sheet should show what the user just saw on screen, even
         // for chunk mode while the batch diarization pass is still
@@ -865,9 +871,19 @@ final class QuickActionsController: ObservableObject {
                         wavURL: self.store.audioURL(for: updated),
                         segments: updated.segments,
                         recordingID: id) {
+                        let preRediarize = updated.segments
                         updated.segments = rediarized
                         if var current = self.store.recordings.first(where: { $0.id == id }) {
                             current.segments = rediarized
+                            // The offline pass re-keyed every SPEAKER_NN, so
+                            // names assigned mid-recording (or in the detail
+                            // view while this pass ran — hence the re-fetched
+                            // row's map, not the snapshot's) must follow the
+                            // utterances they labeled onto the new IDs.
+                            current.speakerNames = SpeakerNameRemapper.remap(
+                                names: current.speakerNames,
+                                from: preRediarize,
+                                to: rediarized)
                             self.store.update(current)
                             updated = current
                         }
