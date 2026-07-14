@@ -251,7 +251,7 @@ struct MilaApp: App {
     @StateObject private var voiceMemosImporter: VoiceMemosImporter
     /// Persistent, app-wide list of speaker names — the pick-list behind
     /// the transcript's speaker rename popover.
-    @StateObject private var speakerDirectory = SpeakerDirectory()
+    @StateObject private var speakerDirectory: SpeakerDirectory
     @StateObject private var updater = UpdaterViewModel()
 
     init() {
@@ -497,6 +497,7 @@ struct MilaApp: App {
                                             languageSettings: langSettings)
         _voiceMemosSettings = StateObject(wrappedValue: vmSettings)
         _voiceMemosImporter = StateObject(wrappedValue: vmImporter)
+        _speakerDirectory = StateObject(wrappedValue: SpeakerDirectory())
         let dictationController = DictationController(store: store,
                                                       transcription: svc,
                                                       hotkeySettings: hotkeys,

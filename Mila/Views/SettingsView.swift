@@ -1317,9 +1317,12 @@ private struct KnownSpeakersSection: View {
                                 }
                                 .buttonStyle(.borderless)
                                 .help("Remove \"\(name)\" from the list")
+                                .accessibilityIdentifier("speakers.known.remove.\(name)")
                             }
                             .padding(.horizontal, 10)
                             .padding(.vertical, 4)
+                            .accessibilityElement(children: .contain)
+                            .accessibilityIdentifier("speakers.known.row.\(name)")
                         }
                     }
                     .padding(.vertical, 4)
@@ -1332,8 +1335,10 @@ private struct KnownSpeakersSection: View {
                 TextField("Add a name…", text: $newName)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit(addName)
+                    .accessibilityIdentifier("speakers.known.addField")
                 Button("Add", action: addName)
                     .disabled(newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .accessibilityIdentifier("speakers.known.addButton")
             }
         }
     }

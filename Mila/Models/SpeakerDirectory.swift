@@ -36,10 +36,12 @@ final class SpeakerDirectory: ObservableObject {
             self.init(directory: tmp)
             return
         }
-        let appSupport = try! FileManager.default.url(for: .applicationSupportDirectory,
-                                                      in: .userDomainMask,
-                                                      appropriateFor: nil,
-                                                      create: true)
+        // Non-throwing lookup + temp-dir fallback: a missing Application
+        // Support directory shouldn't crash the app at launch — worst case
+        // the directory just doesn't persist across reboots.
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory,
+                                                  in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
         self.init(directory: appSupport.appendingPathComponent("Mila", isDirectory: true))
     }
 
