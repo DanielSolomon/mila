@@ -252,6 +252,10 @@ struct MilaApp: App {
     /// Persistent, app-wide list of speaker names — the pick-list behind
     /// the transcript's speaker rename popover.
     @StateObject private var speakerDirectory: SpeakerDirectory
+    /// Mirrors the live transcript to `live/current.json` for external
+    /// tools (mila-mcp). Not observed by any view; held as a StateObject
+    /// purely so it survives SwiftUI re-inits like the other singletons.
+    @StateObject private var liveSidecarWriter: LiveTranscriptSidecarWriter
     @StateObject private var updater = UpdaterViewModel()
 
     init() {
@@ -457,6 +461,12 @@ struct MilaApp: App {
         actions.liveDiarizer = liveDiar
         actions.summarizer = summarizer
         actions.storageSettings = storage
+        // Live-transcript sidecar for external tools (mila-mcp). Anchored
+        // to the store's original root so tests / UI-test temp stores stay
+        // isolated from the user's real app-support directory.
+        let sidecarWriter = LiveTranscriptSidecarWriter(root: store.originalRootDirectory)
+        sidecarWriter.cleanupAtLaunch()
+        actions.liveSidecarWriter = sidecarWriter
         let meetingSettings = MeetingDetectionSettings()
         let detector = MeetingDetector()
         let promptCoordinator = MeetingPromptCoordinator(
@@ -498,6 +508,7 @@ struct MilaApp: App {
         _voiceMemosSettings = StateObject(wrappedValue: vmSettings)
         _voiceMemosImporter = StateObject(wrappedValue: vmImporter)
         _speakerDirectory = StateObject(wrappedValue: SpeakerDirectory())
+        _liveSidecarWriter = StateObject(wrappedValue: sidecarWriter)
         let dictationController = DictationController(store: store,
                                                       transcription: svc,
                                                       hotkeySettings: hotkeys,
@@ -1029,6 +1040,7 @@ struct MilaApp: App {
         // drain belongs here (sleep/lock/quit path) or to
         // `stopRecording` (Stop-button path).
         let actionsRef: QuickActionsController? = actions
+        let sidecarWriter = liveSidecarWriter
 
         var feedTask: Task<Void, Never>?
         var aiEnabledCancellable: AnyCancellable?
@@ -1084,10 +1096,19 @@ struct MilaApp: App {
                     // to a recording that never ran the LLM loop.
                     // Cursor flagged on c95d2bb.
                     aiSession.cancel()
+                    // Still surface the recording to external pollers
+                    // (mila-mcp): they get an honest "recording, but no
+                    // live text on this hardware" status instead of
+                    // silence.
+                    sidecarWriter.begin(title: nil, source: nil, liveAvailable: false)
                     os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
                         .log("wireLiveAIPipeline: .recording skipped — hardware below Live AI bar (model=\(aiSettings.capabilities.marketingName, privacy: .public))")
                     continue
                 }
+                // Open the live-transcript sidecar for this recording so
+                // external tools (mila-mcp) can follow the meeting; the
+                // feed loop below streams content into it.
+                sidecarWriter.begin(title: nil, source: nil, liveAvailable: true)
                 // Live transcription runs on every recording — it's how
                 // the recording UI shows the live transcript pane even
                 // when AI mode is off. Apply the user's tick-interval
@@ -1176,7 +1197,7 @@ struct MilaApp: App {
                     }
 
                 feedTask?.cancel()
-                feedTask = Task { @MainActor [weak transcriber, weak diarizer, weak aiSession, aiSettings, llmSettingsRef] in
+                feedTask = Task { @MainActor [weak transcriber, weak diarizer, weak aiSession, weak sidecarWriter, aiSettings, llmSettingsRef] in
                     var lastFed = ""
                     guard let transcriber else { return }
                     for await _ in transcriber.$segments.values {
@@ -1196,6 +1217,10 @@ struct MilaApp: App {
                         if let diarizer {
                             transcriber.applySpeakerLabels(diarizer.intervals)
                         }
+                        // Mirror the tick to the on-disk live sidecar
+                        // (throttled + deduped inside the writer).
+                        sidecarWriter?.update(segments: transcriber.transcriptSegments,
+                                              speakerNames: transcriber.speakerNames)
                         if aiActive {
                             let text = transcriber.formattedTranscript
                             if text != lastFed, !text.isEmpty {
@@ -1264,6 +1289,11 @@ struct MilaApp: App {
                     // utterance would lose its speaker label.
                     await diarizer.awaitPending()
                     diarizer.stop()
+                    // Close the live sidecar with no handoff id — this
+                    // teardown path (sleep/lock/quit/cancelAll) has no
+                    // saved Recording yet; the Stop-button path closes
+                    // it from stopRecording with the real id instead.
+                    sidecarWriter.finish(recordingID: nil)
                 }
                 // Note: don't cancel aiSession here — QuickActionsController
                 // still needs to read .summary and .actionItems out of
