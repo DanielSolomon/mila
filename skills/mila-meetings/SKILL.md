@@ -45,6 +45,14 @@ assistant:
    - `{changed: false}` → nothing new; keep waiting silently.
    - New segments → the first returned segment replaces the last one
      you already had (live transcription rewrites it); the rest append.
+
+   **Output ordering (critical):** in harnesses that hide text written
+   between tool calls, anything you write before your next tool call is
+   LOST to the user. In every loop turn: poll, **arm the next wake-up
+   timer first** (background sleep / scheduled wakeup), and only then
+   write the echo/answer as the turn's FINAL message with no tool calls
+   after it. Never end a loop turn with a placeholder like "(listening)"
+   after the real content — the placeholder is all the user will see.
 3. Only speak up when the new content warrants it. Default output per
    update: one or two sentences of "what to say next" — a concrete
    suggestion the user could actually say, plus (only when useful) a
