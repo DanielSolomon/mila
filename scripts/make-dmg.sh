@@ -3,8 +3,11 @@
 #
 # Usage: scripts/make-dmg.sh path/to/Mila.app Mila-1.0.0.dmg 1.0.0
 #
-# Output: $DMG_PATH (relative or absolute) ready to upload as a GitHub release
-# asset. Signing identity: $CODESIGN_IDENTITY if set (CI / private pipeline),
+# Output: $DMG_PATH (relative or absolute), a LOCAL TEST artifact. Published
+# releases are produced by the private signing pipeline, which notarizes and
+# runs the release-notes gate (scripts/check-release-notes.sh) before building;
+# this script deliberately skips that gate so local test DMGs don't require
+# release notes. Signing identity: $CODESIGN_IDENTITY if set (CI / private pipeline),
 # else the persistent "Mila Local Dev" self-signed cert if present in the
 # login keychain (created by scripts/install-debug.sh — keeps TCC mic/screen
 # grants across installs), else ad-hoc. Ad-hoc-signed apps get the Gatekeeper
