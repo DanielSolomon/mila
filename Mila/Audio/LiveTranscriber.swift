@@ -304,7 +304,8 @@ final class LiveTranscriber: ObservableObject {
     /// produce the same text.
     var clipboardText: String {
         TranscriptFormatter.plainText(segments: transcriptSegments,
-                                      fallback: fullText)
+                                      fallback: fullText,
+                                      names: speakerNames)
     }
 
     /// VAD path: enqueue a transcribe for a complete utterance. New
