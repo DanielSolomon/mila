@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import OSLog
+import MilaKit
 
 private let recStoreLog = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "RecordingStore")
 
@@ -113,8 +114,11 @@ final class RecordingStore: ObservableObject {
     /// `relocateRecordings(to: nil)` can revert to the original
     /// default-path layout (json files sit alongside the `Recordings/`
     /// subdir, matching the historical shape that pre-v1.7 builds
-    /// shipped).
-    private let originalRootDirectory: URL
+    /// shipped). Exposed (read-only) so app-state siblings that must NOT
+    /// travel with a relocated recordings folder — the store-location
+    /// pointer, the live-transcript sidecar — anchor to the same root,
+    /// keeping test instances (temp roots) isolated automatically.
+    let originalRootDirectory: URL
 
     init(rootDirectory: URL) {
         self.originalRootDirectory = rootDirectory
@@ -131,6 +135,7 @@ final class RecordingStore: ObservableObject {
         load()
         loadFolders()
         loadTombstones()
+        writeStoreLocationPointer()
     }
 
     /// Switch the recordings directory to `newDirectory`. Clears the
@@ -168,6 +173,25 @@ final class RecordingStore: ObservableObject {
         self.pendingRecoveryIDs = []
         load()
         loadFolders()
+        writeStoreLocationPointer()
+    }
+
+    /// Mirror the resolved store paths into `store-location.json` at the
+    /// original root so external tools (mila-mcp) can find the store even
+    /// when the user relocated the recordings directory — the relocation
+    /// itself lives in a security-scoped bookmark another process can't
+    /// resolve. Always written at the ORIGINAL root: on the default path
+    /// that's Application Support/Mila, and test instances (temp roots)
+    /// stay isolated automatically.
+    private func writeStoreLocationPointer() {
+        let pointer = StoreLocationPointer(recordingsDirectory: recordingsDirectory.path,
+                                           storeFile: storeURL.path,
+                                           updatedAt: Date())
+        do {
+            try pointer.write(to: originalRootDirectory)
+        } catch {
+            recStoreLog.error("failed to write store-location pointer: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     func audioURL(for recording: Recording) -> URL {
