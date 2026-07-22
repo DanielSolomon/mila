@@ -205,7 +205,8 @@ struct LiveAIRecordingView: View {
             sectionHeader(icon: "checklist", title: "Action items", isRTL: isRTL)
             VStack(alignment: isRTL ? .trailing : .leading, spacing: 4) {
                 ForEach(aiSession.actionItems) { item in
-                    ActionItemRow(item: item, language: language, isRTL: isRTL)
+                    ActionItemRow(item: item, language: language, isRTL: isRTL,
+                                  speakerNames: transcriber.speakerNames)
                 }
             }
         }
@@ -356,7 +357,16 @@ struct LiveAIRecordingView: View {
                             // tint color.
                             let hasMultipleSpeakers = transcriber.segments.hasMultipleSpeakers
                             ForEach(transcriber.segments) { seg in
-                                TranscriptLineView(segment: seg, language: language, useSpeakerColor: hasMultipleSpeakers)
+                                TranscriptLineView(segment: seg, language: language,
+                                                   useSpeakerColor: hasMultipleSpeakers,
+                                                   speakerNames: transcriber.speakerNames,
+                                                   onAssignName: { raw, name in
+                                                       if let name {
+                                                           transcriber.speakerNames[raw] = name
+                                                       } else {
+                                                           transcriber.speakerNames.removeValue(forKey: raw)
+                                                       }
+                                                   })
                                     .frame(maxWidth: .infinity, alignment: textAlignment)
                                 // Identifier is applied to the inner Text
                                 // inside TranscriptLineView (where SwiftUI
@@ -417,7 +427,8 @@ struct LiveAIRecordingView: View {
         panel.nameFieldStringValue = "Recording · \(f.string(from: Date())).srt"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
-            try TranscriptExporter.writeSRT(segments: snapshot, to: url)
+            try TranscriptExporter.writeSRT(segments: snapshot, to: url,
+                                            names: transcriber.speakerNames)
         } catch {
             NSAlert(error: error).runModal()
         }
@@ -457,6 +468,9 @@ private struct ActionItemRow: View {
     /// / open sidebar and shoved Hebrew action items to the left, which
     /// is the bug this replaces.
     var isRTL: Bool = false
+    /// Live speaker names so the metadata line shows the same label the
+    /// transcript pane does after a mid-recording rename.
+    var speakerNames: [String: String] = [:]
 
     var body: some View {
         let align: Alignment = isRTL ? .trailing : .leading
@@ -484,7 +498,7 @@ private struct ActionItemRow: View {
     @ViewBuilder private var metadataRow: some View {
         HStack(spacing: 8) {
             if let speaker = item.speaker {
-                Text(speaker.friendlySpeakerLabel(language: language))
+                Text(speaker.displaySpeakerName(names: speakerNames, language: language))
                     .font(.caption2.monospaced())
                     .foregroundStyle(.secondary)
             }
@@ -535,6 +549,11 @@ private struct TranscriptLineView: View {
     /// default tint — set by the caller once it's seen more than one
     /// distinct speaker across the live transcript.
     var useSpeakerColor: Bool = false
+    /// User-assigned live speaker names (raw ID → name).
+    var speakerNames: [String: String] = [:]
+    /// Persists a rename picked from the label's popover mid-recording:
+    /// (raw speaker ID, chosen name or nil-to-reset).
+    var onAssignName: (String, String?) -> Void = { _, _ in }
 
     var body: some View {
         // We rely on the PARENT pane's layoutDirection. That mirrors the
@@ -547,10 +566,15 @@ private struct TranscriptLineView: View {
         let lineRTL = segment.text.isPredominantlyHebrew || language == "he"
         HStack(alignment: .top, spacing: 8) {
             if let sp = segment.speaker {
-                Text(sp.friendlySpeakerLabel(language: language))
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(useSpeakerColor ? sp.speakerColor : Color.accentColor)
-                    .frame(minWidth: 96, alignment: .leading)
+                SpeakerLabelButton(
+                    rawID: sp,
+                    names: speakerNames,
+                    language: language,
+                    color: useSpeakerColor ? sp.speakerColor(names: speakerNames) : Color.accentColor,
+                    font: .caption.weight(.semibold),
+                    onAssign: { name in onAssignName(sp, name) }
+                )
+                .frame(minWidth: 96, alignment: .leading)
             } else {
                 Color.clear.frame(width: 96, height: 1)
             }

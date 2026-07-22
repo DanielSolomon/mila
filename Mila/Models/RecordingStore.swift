@@ -374,6 +374,27 @@ final class RecordingStore: ObservableObject {
         persist()
     }
 
+    /// Assign (or clear, with nil/empty) a display name for one raw
+    /// diarizer speaker ID on a recording. Segments keep their raw
+    /// `SPEAKER_NN` IDs — the name is a display overlay resolved at
+    /// render/export time. Regenerates the `.srt` sidecar for completed
+    /// recordings so the on-disk export matches what the UI shows.
+    func setSpeakerName(_ name: String?, forSpeaker rawID: String, recordingID: UUID) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return }
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmed, !trimmed.isEmpty {
+            guard recordings[idx].speakerNames[rawID] != trimmed else { return }
+            recordings[idx].speakerNames[rawID] = trimmed
+        } else {
+            guard recordings[idx].speakerNames[rawID] != nil else { return }
+            recordings[idx].speakerNames.removeValue(forKey: rawID)
+        }
+        persist()
+        if recordings[idx].status == .completed {
+            TranscriptExporter.writeSRT(for: recordings[idx], in: recordingsDirectory)
+        }
+    }
+
     /// Move a recording into a folder (or unfile it with nil). Auto-creates
     /// the folder so callers can drag into a brand-new name without a
     /// separate `createFolder` round-trip. Dedup is case-insensitive — if

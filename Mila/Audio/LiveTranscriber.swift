@@ -61,6 +61,12 @@ final class LiveTranscriber: ObservableObject {
     /// flat string (e.g. the LLM feed via `formattedTranscript`).
     @Published private(set) var segments: [LiveSegment] = []
 
+    /// User-assigned display names for live speakers (raw `SPEAKER_NN`
+    /// → name), set from the live pane's rename popover mid-recording.
+    /// Copied into the saved `Recording` at stop (QuickActionsController),
+    /// where the post-stop re-diarize remaps them onto the re-keyed IDs.
+    @Published var speakerNames: [String: String] = [:]
+
     var chunkSeconds: Double = 30.0
     var windowSeconds: Double = 30.0
     /// When true, route incoming audio through `UtteranceDetector` and
@@ -135,6 +141,7 @@ final class LiveTranscriber: ObservableObject {
         self.samplesDropped = 0
         self.fullText = ""
         self.segments = []
+        self.speakerNames = [:]
         self.lastError = nil
         self.epoch &+= 1
         liveLog.log("LiveTranscriber.start lang=\(language, privacy: .public) chunk=\(self.chunkSeconds, privacy: .public)s window=\(self.windowSeconds, privacy: .public)s useVAD=\(self.useVAD, privacy: .public) epoch=\(self.epoch, privacy: .public)")

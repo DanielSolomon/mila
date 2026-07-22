@@ -1157,6 +1157,10 @@ private struct DiarizationSettingsTabContent: View {
                 .accessibilityIdentifier("speakers.health.ok.probe")
                 .accessibilityLabel(diarization.healthCheckResult?.ok == true ? "ok" : "not_ok")
 
+            Divider()
+
+            KnownSpeakersSection()
+
             Spacer()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1287,6 +1291,70 @@ private struct DiarizationSettingsTabContent: View {
             return "Speaker detection blocked by macOS code signing — reinstall Mila from the official download"
         }
         return "Speaker detection unavailable"
+    }
+}
+
+/// "Known Speakers" — manage the persistent name list behind the
+/// transcript's speaker-rename popover. Names added here (or via the
+/// popover) are offered in every future recording's rename list.
+private struct KnownSpeakersSection: View {
+    @EnvironmentObject private var directory: SpeakerDirectory
+    @State private var newName = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Known speakers")
+                .font(.callout.weight(.semibold))
+            Text("Names you can assign to speakers by clicking their label in a transcript. Removing a name here doesn't change recordings it's already assigned to.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if !directory.names.isEmpty {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(directory.names, id: \.self) { name in
+                            HStack {
+                                Text(name)
+                                Spacer()
+                                Button {
+                                    directory.remove(name)
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.borderless)
+                                .help("Remove \"\(name)\" from the list")
+                                .accessibilityIdentifier("speakers.known.remove.\(name)")
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 4)
+                            .accessibilityElement(children: .contain)
+                            .accessibilityIdentifier("speakers.known.row.\(name)")
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+                .frame(maxHeight: 120)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+            }
+
+            HStack(spacing: 8) {
+                TextField("Add a name…", text: $newName)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(addName)
+                    .accessibilityIdentifier("speakers.known.addField")
+                Button("Add", action: addName)
+                    .disabled(newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .accessibilityIdentifier("speakers.known.addButton")
+            }
+        }
+    }
+
+    private func addName() {
+        if directory.add(newName) != nil {
+            newName = ""
+        }
     }
 }
 
