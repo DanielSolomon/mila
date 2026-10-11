@@ -516,6 +516,40 @@ final class RecordingShareImporterTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(profiles.profile(named: "Dan")).sampleCount, 6, "no double count")
     }
 
+    /// Voice profiles are folded only after the library write succeeded. A
+    /// store that cannot be written must leave `speaker-profiles.json`
+    /// untouched — no merged centroid, no "already imported" token that
+    /// would make a retry skip the speaker.
+    func test_a_failed_library_write_leaves_the_voice_profiles_untouched() async throws {
+        let original = try makeCompletedRecording(in: storeA)
+        let shared = [SharedSpeakerProfile(name: "Daniel", embedding: vector([1, 0]), sampleCount: 4,
+                                           embeddingModel: SpeakerEmbeddingModel.current.id)]
+        let bundle = try await export(original, from: storeA, profiles: shared)
+        let voice = makeVoiceSettings(enabled: true)
+        let profiles = SpeakerProfileStore(directory: rootB, settings: voice)
+        profiles.updateProfile(name: "Dan", embedding: vector([0.99, 0.01]), sampleCount: 2)
+        let profilesFile = rootB.appendingPathComponent("speaker-profiles.json")
+        let bytesBefore = try Data(contentsOf: profilesFile)
+        let importer = makeImporter(profiles: profiles, voice: voice)
+
+        await stage(bundle, with: importer)
+        XCTAssertEqual(importer.pending?.speakerPlan.rows.first?.target,
+                       .merge(into: profiles.profile(named: "Dan")!.id))
+        // Make recordings.json unwritable (a directory in its place). The
+        // file may not exist yet — an empty store has never persisted.
+        try? FileManager.default.removeItem(at: storeB.storeURL)
+        try FileManager.default.createDirectory(at: storeB.storeURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: storeB.storeURL) }
+
+        await importer.confirm()
+        XCTAssertEqual(importer.errorMessage, RecordingShareImporter.ImportError.saveFailed.errorDescription)
+        XCTAssertTrue(storeB.recordings.isEmpty)
+        XCTAssertEqual(recordingsDirectoryNames(storeB), [], "the copied audio is removed again")
+        XCTAssertEqual(profiles.profile(named: "Dan")?.sampleCount, 2, "no fold happened")
+        XCTAssertTrue(profiles.importedShareTokens.isEmpty, "no token, so a retry still offers the merge")
+        XCTAssertEqual(try Data(contentsOf: profilesFile), bytesBefore, "speaker-profiles.json is byte-identical")
+    }
+
     func test_with_voice_recognition_off_profiles_are_blocked_but_the_recording_imports() async throws {
         let original = try makeCompletedRecording(in: storeA)
         let shared = [SharedSpeakerProfile(name: "Daniel", embedding: vector([1, 0]), sampleCount: 4,

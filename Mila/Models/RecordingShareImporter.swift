@@ -418,12 +418,14 @@ final class RecordingShareImporter: ObservableObject {
             return
         }
 
-        // Voice profiles FIRST. A recording whose labels point at profiles
-        // that were never created is wrong; profiles without the recording
-        // are merely unused.
+        // The label rewrite is derived WITHOUT touching the voice profiles:
+        // the profiles are folded only after the library write below has
+        // succeeded, so a failed rename or store write cannot leave the
+        // user's voice data changed (or stamp "already imported" tokens
+        // that would make a retry skip those speakers).
         var mapping: [String: String] = [:]
         if !pending.speakerPlan.isEmpty, let profileStore {
-            mapping = SpeakerProfileImportApplier.apply(pending.speakerPlan, to: profileStore).nameMapping
+            mapping = SpeakerProfileImportApplier.nameMapping(for: pending.speakerPlan, in: profileStore)
         }
 
         // From here to `upsertImported` is one synchronous main-actor run:
@@ -460,6 +462,13 @@ final class RecordingShareImporter: ObservableObject {
             log.error("imported \(recording.id, privacy: .public) but its .txt sidecar did not land")
         case .saved:
             break
+        }
+
+        // The recording is in the library; now the voice profiles. A refused
+        // fold here (the store's own guards) leaves the label as chosen —
+        // the user asserted who the speaker is — and is logged by the applier.
+        if !pending.speakerPlan.isEmpty, let profileStore {
+            _ = SpeakerProfileImportApplier.apply(pending.speakerPlan, to: profileStore)
         }
 
         if let existing, existing.audioFileName != recording.audioFileName {

@@ -28,6 +28,33 @@ struct SpeakerProfileImportResult: Equatable {
 @MainActor
 enum SpeakerProfileImportApplier {
 
+    /// The label rewrite `apply` would produce, computed WITHOUT writing
+    /// anything. `RecordingShareImporter` uses it to relabel the recording
+    /// and save it first, then calls `apply` only once the library write
+    /// succeeded — so a failed import cannot leave the user's voice data
+    /// changed. Same rules as `apply`, kept side by side so they can't drift:
+    /// a merge maps to the local profile's name (identity if it has gone),
+    /// add-as-new maps to the new name, skip and blocked rows map to
+    /// themselves.
+    static func nameMapping(for plan: SpeakerProfileImportPlan,
+                            in store: SpeakerProfileStore) -> [String: String] {
+        var mapping: [String: String] = [:]
+        for row in plan.rows {
+            let incoming = row.incoming.name
+            let target: SpeakerProfileImportPlan.Target = row.isBlocked ? .skip : row.target
+            switch target {
+            case .skip:
+                mapping[incoming] = incoming
+            case .merge(let id):
+                mapping[incoming] = store.profiles.first { $0.id == id }?.name ?? incoming
+            case .addAsNew(let rawName):
+                let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+                mapping[incoming] = name.isEmpty ? incoming : name
+            }
+        }
+        return mapping
+    }
+
     static func apply(_ plan: SpeakerProfileImportPlan,
                       to store: SpeakerProfileStore) -> SpeakerProfileImportResult {
         var result = SpeakerProfileImportResult()
