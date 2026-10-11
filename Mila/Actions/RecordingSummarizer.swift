@@ -85,9 +85,11 @@ final class RecordingSummarizer: ObservableObject {
     /// `cancel(recordingID:)` is what a permanent delete calls, and that
     /// surfaces here as a thrown `CancellationError`).
     ///
-    /// Exactly one of the branches below fires it per attempt, and each one
-    /// returns immediately afterwards, so a single `runSummary` can never fire
-    /// twice. Anything the observer does is its own problem: this is a plain
+    /// Exactly one of the branches below fires it per attempt — or hands the
+    /// attempt off to a re-run (`replayIfSummaryLanguageChanged`), whose own
+    /// completion fires instead — and each one returns immediately
+    /// afterwards, so a single `runSummary` can never fire twice. Anything
+    /// the observer does is its own problem: this is a plain
     /// synchronous call on the main actor, so an observer that throws is a
     /// programmer error, but an observer that *fails internally* (e.g. a file
     /// write that can't complete) cannot stall or corrupt summarisation —
@@ -259,6 +261,43 @@ final class RecordingSummarizer: ObservableObject {
         runSummary(for: recording, force: true)
     }
 
+    /// The "Summary language" menu's one entry point (`SummaryLanguageMenu`,
+    /// via every host's `onPick`): persist `language` as the per-recording
+    /// override on the LIVE row and regenerate from that row — never from
+    /// the `Recording` the menu captured, which can be a stale snapshot (see
+    /// `RecordingStore.setSummaryLanguage`).
+    ///
+    /// A pick that matches what is already in force is a no-op: nothing is
+    /// written and no LLM call starts. The menu shows a ✓ on that entry, so
+    /// re-picking it reads as "leave it", and the explicit re-run is
+    /// "Regenerate summary", one entry up. Before this lived here each of
+    /// the three hosts had its own copy of the glue, and every copy
+    /// regenerated unconditionally (review of #308).
+    ///
+    /// Two comparisons, because the stored string and the language in force
+    /// can disagree: an unrecognised persisted code (`"fr"`, hand-edited or
+    /// from a newer app) resolves to Default through
+    /// `summaryLanguageOverride`, which is what the ✓ reflects. The RAW
+    /// value decides whether to write — so picking Default on such a row
+    /// cleans the junk out of recordings.json instead of leaving it there
+    /// forever — and the TYPED override decides whether to regenerate, so
+    /// that clean-up does not cost an LLM call for a summary that would come
+    /// back in the same language.
+    func setSummaryLanguage(_ language: RecordingLanguage?, for recordingID: UUID) {
+        guard let live = liveRecording(recordingID) else { return }
+        let code = language?.rawValue
+        guard live.summaryLanguage != code else {
+            summarizerLog.log("summary language \(self.shortID(recordingID), privacy: .public): unchanged — nothing to do")
+            return
+        }
+        guard let updated = store.setSummaryLanguage(code, recordingID: recordingID) else { return }
+        guard live.summaryLanguageOverride != language else {
+            summarizerLog.log("summary language \(self.shortID(recordingID), privacy: .public): normalised an unrecognised code — language in force unchanged, not regenerating")
+            return
+        }
+        regenerate(updated)
+    }
+
     /// Scan the store for completed recordings missing a summary, then
     /// process them newest-first with at most `maxConcurrent` in-flight
     /// CLI invocations. No-op when the LLM CLI isn't configured (the
@@ -363,16 +402,13 @@ final class RecordingSummarizer: ObservableObject {
             ? llmSettings.openAIModelName
             : liveAISettings.model
         let extraArgs = llmSettings.extraArgsTokens
-        let promptLanguageName: String = {
-            switch liveAISettings.outputLanguage {
-            case .auto:
-                return recording.fullText.isPredominantlyHebrew ? "Hebrew" : "English"
-            case .english:
-                return "English"
-            case .hebrew:
-                return "Hebrew"
-            }
-        }()
+        // Per-recording override first, then the global setting (with Auto
+        // resolved against the transcript text). Resolved ONCE here, from the
+        // snapshot we were handed; the completion block below checks whether
+        // the override moved while the call was out.
+        let promptLanguageName = Self.promptLanguageName(for: recording,
+                                                         global: liveAISettings.outputLanguage)
+        let languageAtStart = recording.summaryLanguage
         let basePrompt = liveAISettings.summaryPrompt
             .replacingOccurrences(of: "{{LANGUAGE}}", with: promptLanguageName)
         // Wrap the user's plain-text summary prompt so the one-shot call
@@ -381,7 +417,7 @@ final class RecordingSummarizer: ObservableObject {
         // `promptWithActionItems`: the summary stays PLAIN TEXT and only a
         // compact item array is JSON, so a long multi-line Hebrew summary
         // full of quotes can't corrupt the parse.
-        let prompt = Self.promptWithActionItems(base: basePrompt)
+        let prompt = Self.promptWithActionItems(base: basePrompt, language: promptLanguageName)
         let transcript = recording.fullText
         let timeout = timeoutSeconds
         // OpenAI-compatible config captured up front so the detached call
@@ -398,7 +434,10 @@ final class RecordingSummarizer: ObservableObject {
         let runLLM = self.runLLM
 
         inFlightIDs.insert(id)
-        summarizerLog.log("started \(self.shortID(id), privacy: .public) transcript=\(transcript.count, privacy: .public)c force=\(force, privacy: .public)")
+        // `language` is the resolved keyword ("Hebrew"/"English"), never user
+        // text, so it is safe as a `.public` field — and it is what makes a
+        // "why is this summary in the wrong language" report diagnosable.
+        summarizerLog.log("started \(self.shortID(id), privacy: .public) transcript=\(transcript.count, privacy: .public)c force=\(force, privacy: .public) language=\(promptLanguageName, privacy: .public) override=\(languageAtStart != nil, privacy: .public)")
 
         let task = Task { @MainActor [weak self] in
             defer {
@@ -449,10 +488,15 @@ final class RecordingSummarizer: ObservableObject {
                     // transcript and is user content, so it must not reach a
                     // `.public` log field (`bugbot-rules/no-user-content-in-logs.md`).
                     summarizerLog.log("skipped \(self?.shortID(id) ?? "?", privacy: .public): no summary parsed origin=\(origin.rawValue, privacy: .public) output=\(raw.count, privacy: .public)c")
-                    // No summary landed — let a pending export fall back to
+                    guard let self else { return }
+                    // A language picked while this call was out gets its
+                    // re-run whatever became of the call it interrupted; the
+                    // re-run signals in this attempt's place.
+                    if self.replayIfSummaryLanguageChanged(id, since: languageAtStart) { return }
+                    // No summary came back — let a pending export fall back to
                     // the transcript rather than waiting forever. Skip the
                     // signal entirely if the recording went away mid-flight.
-                    if let self, let current = self.liveRecording(id) {
+                    if let current = self.liveRecording(id) {
                         self.onSummaryFinished?(current)
                     }
                     return
@@ -466,6 +510,10 @@ final class RecordingSummarizer: ObservableObject {
                     // Deleted mid-flight — nothing to export, so no signal.
                     return
                 }
+                // Checked before the "a summary is already there" skip below:
+                // a pick is a user action and wins over whatever another path
+                // stored in the old language while this call was out.
+                if self.replayIfSummaryLanguageChanged(id, since: languageAtStart) { return }
                 let existing = (current.summary ?? "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if !force, !existing.isEmpty {
@@ -503,16 +551,52 @@ final class RecordingSummarizer: ObservableObject {
                     failed \(self?.shortID(id) ?? "?", privacy: .public): \
                     \(LLMRunnerError.logMessage(for: error), privacy: .public)
                     """)
+                guard let self else { return }
+                // A language picked while this call was out gets its re-run
+                // whatever became of the call it interrupted — a timeout at
+                // the wrong moment must not leave the override persisted and
+                // never honoured. The re-run signals in this attempt's place.
+                if self.replayIfSummaryLanguageChanged(id, since: languageAtStart) { return }
                 // Failed generation — signal so a pending export can still
                 // write the transcript fallback. A permanent delete cancels
-                // the task, which lands here as a CancellationError, so the
+                // the task, which arrives here as a CancellationError, so the
                 // store lookup is what stops a deleted recording being filed.
-                if let self, let current = self.liveRecording(id) {
+                if let current = self.liveRecording(id) {
                     self.onSummaryFinished?(current)
                 }
             }
         }
         inFlight[id] = task
+    }
+
+    /// The user picked a different summary language while a call for `id`
+    /// was out. Whatever that call produced — a summary in the OLD language,
+    /// nothing parseable, or an error — the dedup guard at the top of
+    /// `runSummary` dropped the regenerate the menu fired, so without this
+    /// the override would be persisted and never honoured. Called from every
+    /// completion outcome, not just success: a pick is a user action and
+    /// gets its one re-run regardless of what became of the call it
+    /// interrupted (the re-run captures the NEW language as its own
+    /// `languageAtStart`, so it cannot chain). Returns true when a re-run was
+    /// scheduled, in which case the caller must NOT fire `onSummaryFinished`
+    /// — the re-run's own completion does.
+    ///
+    /// Deferred one tick so the task's `defer` has cleared `inFlight` first;
+    /// otherwise the re-run would hit the same guard. The row is re-read AT
+    /// the tick rather than captured: a permanent delete in between must not
+    /// spend an LLM call on a recording that is gone. Only the per-recording
+    /// field is compared: a GLOBAL setting flip mid-flight keeps the result,
+    /// as it always has.
+    private func replayIfSummaryLanguageChanged(_ id: UUID, since languageAtStart: String?) -> Bool {
+        guard let current = liveRecording(id), current.summaryLanguage != languageAtStart else {
+            return false
+        }
+        summarizerLog.log("discarded \(self.shortID(id), privacy: .public): summary language changed mid-flight — regenerating")
+        Task { @MainActor [weak self] in
+            guard let self, let live = self.liveRecording(id) else { return }
+            self.regenerate(live)
+        }
+        return true
     }
 
     /// Log why a `summarizeIfNeeded` call was rejected. Split out so the
@@ -554,15 +638,52 @@ final class RecordingSummarizer: ObservableObject {
     /// less prone to stray quotes — needs to be valid JSON.
     static let actionItemsSentinel = "###ACTION_ITEMS###"
 
+    /// The language name the one-shot prompt is written for: the recording's
+    /// own `summaryLanguageOverride` when the user set one, otherwise the
+    /// global `LiveAISettings.outputLanguage` — with `.auto` resolved against
+    /// the transcript text here rather than passed to the model as "match the
+    /// transcript", because Claude / cursor-agent obey a concrete "Output in
+    /// Hebrew" far more reliably than an introspective instruction (same
+    /// reasoning as `LiveAISession.kick`).
+    ///
+    /// Pure and static so a test can pin the resolution order without a
+    /// store or a runner. Returns the exact token substituted for
+    /// `{{LANGUAGE}}` and appended by `promptWithActionItems`.
+    static func promptLanguageName(for recording: Recording,
+                                   global: LiveAISettings.OutputLanguage) -> String {
+        if let override = recording.summaryLanguageOverride {
+            return override.displayName
+        }
+        switch global {
+        case .auto:
+            return recording.fullText.isPredominantlyHebrew ? "Hebrew" : "English"
+        case .english:
+            return "English"
+        case .hebrew:
+            return "Hebrew"
+        }
+    }
+
+    /// The one line that always carries the output language to the model.
+    /// `summaryPrompt`'s `{{LANGUAGE}}` slot is the user's to edit — and a
+    /// user who edited it out used to get a silent no-op from the Output
+    /// language setting (and would from the per-recording override too). So
+    /// the language is stated here as well, in the part of the request Mila
+    /// owns, and it names the action items explicitly because the base prompt
+    /// never mentions them.
+    static func languageDirective(_ language: String) -> String {
+        "Write the summary and every action item in \(language)."
+    }
+
     /// Wrap the user's plain-text summary prompt so the one-shot call also
     /// returns action items, WITHOUT embedding the summary in JSON. The
     /// user's `summaryPrompt` still drives the summary's content and style
     /// (including its `{{LANGUAGE}}` directive); this only appends the
-    /// output-format + action-item contract. Building the request here rather
-    /// than baking it into the persisted `summaryPrompt` means a user's
-    /// customised prompt keeps working and no persisted-default migration is
-    /// needed.
-    static func promptWithActionItems(base: String) -> String {
+    /// output-format + action-item contract and the language directive.
+    /// Building the request here rather than baking it into the persisted
+    /// `summaryPrompt` means a user's customised prompt keeps working and no
+    /// persisted-default migration is needed.
+    static func promptWithActionItems(base: String, language: String) -> String {
         """
         \(base)
 
@@ -580,6 +701,8 @@ final class RecordingSummarizer: ObservableObject {
         task someone committed to do (with or without a deadline) or an \
         explicit follow-up or request. If there are none, output an empty \
         array: []
+
+        \(languageDirective(language))
         """
     }
 

@@ -14,6 +14,7 @@ struct RenameRecordingSheet: View {
     @EnvironmentObject private var store: RecordingStore
     @EnvironmentObject private var llm: LLMSettings
     @EnvironmentObject private var summarizer: RecordingSummarizer
+    @EnvironmentObject private var liveAI: LiveAISettings
 
     @State private var title: String
     /// Mila folder the recording should be filed under (nil = unfiled).
@@ -456,7 +457,19 @@ struct RenameRecordingSheet: View {
             onRegenerateSummary: canRegenerateSummary
                 ? { summarizer.regenerate(liveRecording) }
                 : nil,
-            isSummarizing: summarizer.isSummarizing(liveRecording.id)
+            isSummarizing: summarizer.isSummarizing(liveRecording.id),
+            summaryLanguage: liveRecording.summaryLanguageOverride,
+            globalOutputLanguage: liveAI.outputLanguage,
+            onSetSummaryLanguage: canRegenerateSummary
+                ? { summarizer.setSummaryLanguage($0, for: liveRecording.id) }
+                : nil,
+            // From the row's status, not `TranscriptionService`: the sheet
+            // body deliberately does not observe the service (only
+            // `RenameTranscriptionStatusRow` does), and the store-backed
+            // `liveRecording` already carries the pass state — the same
+            // signal `transcriptReady` reads.
+            isTranscribing: liveRecording.status == .pending
+                || liveRecording.status == .running
         )
         .padding(.horizontal, 10)
         .padding(.vertical, 8)

@@ -30,6 +30,8 @@ private struct RecordingContextMenu: ViewModifier {
     @EnvironmentObject private var store: RecordingStore
     @EnvironmentObject private var transcription: TranscriptionService
     @EnvironmentObject private var llm: LLMSettings
+    @EnvironmentObject private var summarizer: RecordingSummarizer
+    @EnvironmentObject private var liveAI: LiveAISettings
 
     @State private var renameRequest: String?
     @State private var promptForNewFolder = false
@@ -148,6 +150,20 @@ private struct RecordingContextMenu: ViewModifier {
                     showingSendSheet = true
                 }
                 .disabled(recording.fullText.isEmpty && recording.segments.isEmpty)
+                // Per-recording summary language. Picking one persists it on
+                // the live row and regenerates right away, so the user sees
+                // the summary + action items come back in that language
+                // instead of waiting for the next automatic pass. Re-picking
+                // the ✓'d entry is a no-op (`RecordingSummarizer.setSummaryLanguage`).
+                SummaryLanguageMenu(
+                    current: recording.summaryLanguageOverride,
+                    global: liveAI.outputLanguage,
+                    isDisabled: isBusy
+                        || summarizer.isSummarizing(recording.id)
+                        || recording.fullText
+                            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                    onPick: { summarizer.setSummaryLanguage($0, for: recording.id) }
+                )
             }
             Divider()
             Button("Export Subtitles (.srt)…") {

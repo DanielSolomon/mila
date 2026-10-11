@@ -12,6 +12,7 @@ struct RecordingDetailView: View {
     @EnvironmentObject private var modelManager: ModelManager
     @EnvironmentObject private var llmSettings: LLMSettings
     @EnvironmentObject private var summarizer: RecordingSummarizer
+    @EnvironmentObject private var liveAI: LiveAISettings
 
     @State private var player: AVPlayer?
     @State private var currentTime: Double = 0
@@ -67,7 +68,13 @@ struct RecordingDetailView: View {
                 isSummarizing: summarizer.isSummarizing(recording.id),
                 onRegenerateSummary: canRegenerateSummary
                     ? { summarizer.regenerate(recording) }
-                    : nil
+                    : nil,
+                summaryLanguage: recording.summaryLanguageOverride,
+                globalOutputLanguage: liveAI.outputLanguage,
+                onSetSummaryLanguage: canRegenerateSummary
+                    ? { summarizer.setSummaryLanguage($0, for: recording.id) }
+                    : nil,
+                isTranscribing: isTranscriptionBusy
             )
             transcriptArea
                 // Force the transcript area to take the remaining
@@ -177,8 +184,7 @@ struct RecordingDetailView: View {
 
     private var actionButtons: some View {
         let currentLang = RecordingLanguage.fromCode(recording.language)
-        let busy = transcription.activeRecordingID == recording.id
-                   || transcription.pendingIDs.contains(recording.id)
+        let busy = isTranscriptionBusy
         // Icon-only buttons with hover tooltips. Labeled buttons here
         // competed with the title for header width and truncated ("Copy
         // tra…"); icons keep all four actions visible at any window size.
@@ -260,7 +266,6 @@ struct RecordingDetailView: View {
         transcription.enqueue(prepared, isRetranscription: true)
     }
 
-
     /// Whether the user can ask for a fresh summary right now. Gates the
     /// "Regenerate summary" context-menu entry in `AIOverviewBanner` so
     /// it never shows up for recordings without an LLM CLI configured
@@ -272,6 +277,15 @@ struct RecordingDetailView: View {
         return !recording.fullText
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .isEmpty
+    }
+
+    /// Queued for or inside a transcription pass. One predicate for the
+    /// header's Re-transcribe menu and the AI overview's regenerate /
+    /// summary-language entries, so the two cannot disagree about whether
+    /// the transcript is about to change under a summary call.
+    private var isTranscriptionBusy: Bool {
+        transcription.activeRecordingID == recording.id
+            || transcription.pendingIDs.contains(recording.id)
     }
 
     /// Human-readable name of the whisper model that will run for the
@@ -810,6 +824,12 @@ private struct AIOverviewBanner: View {
     /// hides the "Regenerate summary" item (e.g. when no LLM is
     /// configured or the transcript is empty).
     var onRegenerateSummary: (() -> Void)? = nil
+    /// Forwarded to `AIOverviewSection` for its "Summary language" submenu.
+    var summaryLanguage: RecordingLanguage? = nil
+    var globalOutputLanguage: LiveAISettings.OutputLanguage = .auto
+    var onSetSummaryLanguage: ((RecordingLanguage?) -> Void)? = nil
+    /// Forwarded to `AIOverviewSection.isTranscribing`.
+    var isTranscribing: Bool = false
 
     var body: some View {
         let section = AIOverviewSection(
@@ -822,7 +842,11 @@ private struct AIOverviewBanner: View {
             // buttons (Summary+Action-items up top, transcript in the
             // transcript area), so the per-block header copy buttons are
             // hidden here. The block's native right-click "Copy" stays.
-            showsBlockCopyButtons: false
+            showsBlockCopyButtons: false,
+            summaryLanguage: summaryLanguage,
+            globalOutputLanguage: globalOutputLanguage,
+            onSetSummaryLanguage: onSetSummaryLanguage,
+            isTranscribing: isTranscribing
         )
         if section.hasContent {
             VStack(spacing: 0) {
