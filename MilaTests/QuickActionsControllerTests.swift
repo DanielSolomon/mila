@@ -458,6 +458,42 @@ final class QuickActionsControllerTests: XCTestCase {
         XCTAssertEqual(maxConcurrent, 1)
     }
 
+    /// ⌘O is legitimately concurrent with a recording, and `activeJob` is what
+    /// backs `isRecording`. `transcribeFile` used to claim it unconditionally
+    /// and release it to `.none` afterwards, so importing a file mid-meeting
+    /// made the app forget the mic was hot: the live view swapped back to
+    /// Home, the chip vanished, the sleep / lock guards stopped stopping the
+    /// recording, and Stop later titled it from the `default:` branch.
+    /// (Surfaced by Cursor Bugbot on #294, where the new `.starting` state
+    /// opened a second window for the same clobber — that one is pinned in
+    /// `RecordStartingStateTests`.)
+    func test_file_import_during_a_recording_does_not_end_it() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        let url = store.freshAudioURL(suggestedName: "ImportWhileRecording")
+        try TestSupport.writeStereo48kSineWav(at: url, durationSeconds: 0.4)
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        XCTAssertTrue(controller.isRecording)
+
+        let imported = tempRoot.appendingPathComponent("import-while-recording.wav")
+        try TestSupport.writeStereo48kSineWav(at: imported, durationSeconds: 0.4)
+        await controller.transcribeFile(imported)
+
+        XCTAssertEqual(controller.activeJob, .recording(withSystemAudio: false),
+                       "an import must not take activeJob away from a live recording")
+        XCTAssertTrue(controller.isRecording, "the mic is still hot; the app must still say so")
+        XCTAssertNotNil(store.recordings.first { $0.title == "import-while-recording" },
+                        "the import itself still goes through")
+
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+        let stored = try XCTUnwrap(savedRecording(for: url))
+        XCTAssertEqual(stored.source, .microphone,
+                       "Stop must still see the recording's own job, not the import's leftovers")
+        XCTAssertEqual(controller.activeJob, .none)
+    }
+
     // MARK: - State machine
 
     func test_active_job_is_none_initially() {
@@ -585,6 +621,26 @@ final class QuickActionsControllerTests: XCTestCase {
         await controller.toggleVoiceMemo()
         XCTAssertEqual(controller.activeJob, .none)
         XCTAssertFalse(controller.isRecording)
+        controller.isFinalizingRecording = false
+    }
+
+    /// The app picker's "Start recording" calls `startAppRecording` directly,
+    /// and the picker is not disabled during the drain the way the Home
+    /// button is, so this path needs the same finalize gate as `toggleRecord`.
+    /// The permission-alert and error assertions are what make the test
+    /// non-vacuous: without the gate the path publishes `.starting` and runs
+    /// a real system-audio bring-up, which on a grant-less CI host comes back
+    /// to `.none` through one of those two.
+    func test_startAppRecording_no_op_while_finalizing() async {
+        XCTAssertEqual(controller.activeJob, .none)
+        controller.isFinalizingRecording = true
+        await controller.startAppRecording(app: nil, includeMic: false)
+        XCTAssertEqual(controller.activeJob, .none,
+                       "startAppRecording must not start a recording while finalize is in flight")
+        XCTAssertFalse(controller.isRecording)
+        XCTAssertEqual(session.state, .idle)
+        XCTAssertFalse(controller.screenRecordingPermissionMissing)
+        XCTAssertNil(service.lastError)
         controller.isFinalizingRecording = false
     }
 

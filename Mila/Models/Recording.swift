@@ -118,6 +118,28 @@ struct Recording: Identifiable, Codable, Hashable {
     /// When the bundle that brought this recording was exported (the
     /// sender's clock). Set together with `sharedBy`, nil otherwise.
     var sharedAt: Date?
+    /// Per-recording override of the language the AI summary and action
+    /// items are written in — a `RecordingLanguage` raw value (`"he"` /
+    /// `"en"`). nil means "follow Settings → AI Features → Output language",
+    /// which is what every recording has until the user picks a language
+    /// for it from the Summary language menu. Independent of `language`
+    /// (the whisper model): a Hebrew meeting can carry an English summary.
+    /// Survives re-transcription on purpose — it records what the user
+    /// asked for, not what the transcript happened to be in.
+    ///
+    /// Read through `summaryLanguageOverride`, which refuses anything that
+    /// is not one of the two known codes.
+    var summaryLanguage: String?
+
+    /// `summaryLanguage` as a `RecordingLanguage`, or nil when unset OR
+    /// unrecognised. Deliberately `init(rawValue:)` rather than
+    /// `RecordingLanguage.fromCode`: `fromCode` falls back to Hebrew for any
+    /// unknown string, which would turn a hand-edited `"fr"` in
+    /// recordings.json into a silent Hebrew override. Unknown → nil → the
+    /// global setting applies (`bugbot-rules/untrusted-persisted-data.md`).
+    var summaryLanguageOverride: RecordingLanguage? {
+        summaryLanguage.flatMap(RecordingLanguage.init(rawValue:))
+    }
 
     /// Sentinel stored in `voiceMemoFolderUUID` for memos imported from the
     /// Voice Memos "Unfiled" bucket, which has no real folder UUID. Keeps
@@ -147,7 +169,8 @@ struct Recording: Identifiable, Codable, Hashable {
          voiceMemoFolderUUID: String? = nil,
          speakerNames: [String: String] = [:],
          sharedBy: String? = nil,
-         sharedAt: Date? = nil) {
+         sharedAt: Date? = nil,
+         summaryLanguage: String? = nil) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -170,6 +193,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.speakerNames = speakerNames
         self.sharedBy = sharedBy
         self.sharedAt = sharedAt
+        self.summaryLanguage = summaryLanguage
     }
 
     var isTrashed: Bool { deletedAt != nil }
@@ -209,7 +233,7 @@ struct Recording: Identifiable, Codable, Hashable {
              status, language, modelName, segments, deletedAt, folder, appName,
              appBundleID,
              summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID,
-             speakerNames, sharedBy, sharedAt
+             speakerNames, sharedBy, sharedAt, summaryLanguage
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
         // Legacy records that had it inline are decoded via the custom init.
         case fullText
@@ -238,6 +262,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.speakerNames = try c.decodeIfPresent([String: String].self, forKey: .speakerNames) ?? [:]
         self.sharedBy = try c.decodeIfPresent(String.self, forKey: .sharedBy)
         self.sharedAt = try c.decodeIfPresent(Date.self, forKey: .sharedAt)
+        self.summaryLanguage = try c.decodeIfPresent(String.self, forKey: .summaryLanguage)
         // Legacy records still have fullText inline; new records leave it
         // empty here and RecordingStore loads it from the sidecar .txt.
         self.fullText = try c.decodeIfPresent(String.self, forKey: .fullText) ?? ""
@@ -270,6 +295,9 @@ struct Recording: Identifiable, Codable, Hashable {
         // byte-for-byte as before. Mirrored in MilaKit's `StoredRecording`.
         try c.encodeIfPresent(sharedBy, forKey: .sharedBy)
         try c.encodeIfPresent(sharedAt, forKey: .sharedAt)
+        // Omitted when nil so a recordings.json nobody has set an override
+        // in is byte-identical to what the previous release wrote.
+        try c.encodeIfPresent(summaryLanguage, forKey: .summaryLanguage)
         // fullText intentionally omitted — sidecar .txt is the source of truth.
     }
 

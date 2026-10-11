@@ -109,6 +109,10 @@ struct ShareManifest: Codable, Equatable {
         var speakerNames: [String: String]
         var summary: String?
         var actionItems: [ActionItem]?
+        /// The sender's per-recording summary-language override (a
+        /// `RecordingLanguage` raw value), so a regenerated summary on the
+        /// receiving side comes out in the language the sender chose.
+        var summaryLanguage: String?
 
         /// `TranscriptSegment` without its `id`: that UUID exists to give
         /// SwiftUI lists a stable identity and is regenerated on import.
@@ -179,7 +183,7 @@ struct ShareManifest: Codable, Equatable {
         init(id: UUID, title: String, createdAt: Date, duration: Double, source: String,
              language: String, modelName: String?, appName: String?, appBundleID: String?,
              segments: [Segment], speakerNames: [String: String], summary: String?,
-             actionItems: [ActionItem]?) {
+             actionItems: [ActionItem]?, summaryLanguage: String? = nil) {
             self.id = id
             self.title = title
             self.createdAt = createdAt
@@ -193,11 +197,12 @@ struct ShareManifest: Codable, Equatable {
             self.speakerNames = speakerNames
             self.summary = summary
             self.actionItems = actionItems
+            self.summaryLanguage = summaryLanguage
         }
 
         private enum CodingKeys: String, CodingKey {
             case id, title, createdAt, duration, source, language, modelName, appName,
-                 appBundleID, segments, speakerNames, summary, actionItems
+                 appBundleID, segments, speakerNames, summary, actionItems, summaryLanguage
         }
 
         init(from decoder: Decoder) throws {
@@ -215,6 +220,7 @@ struct ShareManifest: Codable, Equatable {
             speakerNames = try c.decodeIfPresent([String: String].self, forKey: .speakerNames) ?? [:]
             summary = try c.decodeIfPresent(String.self, forKey: .summary)
             actionItems = try c.decodeIfPresent([ActionItem].self, forKey: .actionItems)
+            summaryLanguage = try c.decodeIfPresent(String.self, forKey: .summaryLanguage)
         }
 
         /// The names this recording's transcript actually uses, in
@@ -397,7 +403,8 @@ extension ShareManifest.RecordingPayload {
                 ActionItem(id: $0.id, text: $0.text, speaker: $0.speaker,
                            timestampSeconds: $0.timestampSeconds,
                            source: $0.source.rawValue, addedAt: $0.addedAt)
-            }
+            },
+            summaryLanguage: recording.summaryLanguage
         )
     }
 
@@ -437,7 +444,8 @@ extension ShareManifest.RecordingPayload {
             },
             speakerNames: speakerNames,
             sharedBy: sharedBy,
-            sharedAt: sharedAt
+            sharedAt: sharedAt,
+            summaryLanguage: summaryLanguage
         )
     }
 }

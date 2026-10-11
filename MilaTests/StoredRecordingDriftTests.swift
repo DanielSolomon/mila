@@ -62,7 +62,8 @@ final class StoredRecordingDriftTests: XCTestCase {
             voiceMemoFolderUUID: "VMF-1",
             speakerNames: ["SPEAKER_00": "Daniel", "SPEAKER_01": "John Doe"],
             sharedBy: "Ada Lovelace",
-            sharedAt: created
+            sharedAt: created,
+            summaryLanguage: "en"
         )
     }
 
@@ -104,6 +105,7 @@ final class StoredRecordingDriftTests: XCTestCase {
         XCTAssertEqual(s.speakerNames, ["SPEAKER_00": "Daniel", "SPEAKER_01": "John Doe"])
         XCTAssertEqual(s.sharedBy, "Ada Lovelace")
         XCTAssertEqual(s.sharedAt, created)
+        XCTAssertEqual(s.summaryLanguage, "en")
         // fullText is deliberately NOT encoded by the app (sidecar .txt owns it).
         XCTAssertNil(s.legacyFullText)
         XCTAssertEqual(s.transcriptFileName, "Weekly sync.txt")
@@ -293,6 +295,7 @@ final class StoredRecordingDriftTests: XCTestCase {
         XCTAssertFalse(s.isTrashed)
         XCTAssertEqual(s.segments.count, 0)
         XCTAssertNil(s.actionItems)
+        XCTAssertNil(s.summaryLanguage)
     }
 
     func test_legacy_inline_fulltext_decodes() throws {

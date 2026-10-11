@@ -32,6 +32,8 @@ private struct RecordingContextMenu: ViewModifier {
     @EnvironmentObject private var llm: LLMSettings
     @EnvironmentObject private var speakerProfileStore: SpeakerProfileStore
     @EnvironmentObject private var voiceRecognition: VoiceRecognitionSettings
+    @EnvironmentObject private var summarizer: RecordingSummarizer
+    @EnvironmentObject private var liveAI: LiveAISettings
 
     @State private var renameRequest: String?
     /// Non-nil while the `.milashare` export sheet (voice-profile opt-in) is
@@ -154,6 +156,20 @@ private struct RecordingContextMenu: ViewModifier {
                     showingSendSheet = true
                 }
                 .disabled(recording.fullText.isEmpty && recording.segments.isEmpty)
+                // Per-recording summary language. Picking one persists it on
+                // the live row and regenerates right away, so the user sees
+                // the summary + action items come back in that language
+                // instead of waiting for the next automatic pass. Re-picking
+                // the ✓'d entry is a no-op (`RecordingSummarizer.setSummaryLanguage`).
+                SummaryLanguageMenu(
+                    current: recording.summaryLanguageOverride,
+                    global: liveAI.outputLanguage,
+                    isDisabled: isBusy
+                        || summarizer.isSummarizing(recording.id)
+                        || recording.fullText
+                            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                    onPick: { summarizer.setSummaryLanguage($0, for: recording.id) }
+                )
             }
             Divider()
             Button("Share Recording…") {

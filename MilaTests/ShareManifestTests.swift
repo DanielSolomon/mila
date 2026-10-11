@@ -200,7 +200,7 @@ final class ShareManifestTests: XCTestCase {
                                      timestampSeconds: 3, source: .voiceCommand, addedAt: created)],
             voiceMemoUniqueID: "VM-1", voiceMemoFolderUUID: "VMF-1",
             speakerNames: ["SPEAKER_00": "Daniel", "SPEAKER_01": "John Doe"],
-            sharedBy: "Someone Else", sharedAt: created)
+            sharedBy: "Someone Else", sharedAt: created, summaryLanguage: "en")
     }
 
     func test_payload_strips_machine_specific_fields_and_keeps_content() throws {
@@ -215,6 +215,7 @@ final class ShareManifestTests: XCTestCase {
         XCTAssertEqual(payload.summary, "A summary.")
         XCTAssertEqual(payload.actionItems?.first?.source, "voice_command")
         XCTAssertEqual(payload.appBundleID, "us.zoom.xos")
+        XCTAssertEqual(payload.summaryLanguage, "en")
 
         let json = try JSONSerialization.jsonObject(
             with: ShareManifest.encoder().encode(payload)) as! [String: Any]
@@ -244,6 +245,7 @@ final class ShareManifestTests: XCTestCase {
         XCTAssertEqual(made.segments.count, 2)
         XCTAssertEqual(made.actionItems?.first?.source, .voiceCommand)
         XCTAssertEqual(made.speakerNames["SPEAKER_01"], "John Doe")
+        XCTAssertEqual(made.summaryLanguage, "en")
         XCTAssertNil(made.voiceMemoUniqueID)
     }
 
