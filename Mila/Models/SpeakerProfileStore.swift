@@ -559,6 +559,95 @@ final class SpeakerProfileStore: ObservableObject {
         save()
     }
 
+    // MARK: - Snapshot / restore
+
+    /// The store's state at one moment, for `restore(_:)`. Opaque on
+    /// purpose: only a snapshot this store handed out can be restored.
+    struct Snapshot {
+        fileprivate enum File {
+            case absent
+            case bytes(Data)
+            /// It exists but could not be read; `restore` leaves it alone.
+            case unreadable
+        }
+        fileprivate let profiles: [VoiceProfile]
+        fileprivate let file: File
+    }
+
+    /// Capture the profiles in memory and `speaker-profiles.json` as it is
+    /// on disk, so a caller that writes to this store ahead of a commit
+    /// point it does not own can take the writes back.
+    ///
+    /// `RecordingShareImporter.confirm()` is that caller: it folds a
+    /// `.milashare`'s voice profiles in BEFORE the recording row, because
+    /// the row's speaker labels come out of that step, and the row's
+    /// `recordings.json` write can still fail. Without this, a failed
+    /// import left centroids moved, new profiles created and import tokens
+    /// recorded for a recording that does not exist (#319).
+    ///
+    /// The file is captured as raw bytes, read from disk now rather than
+    /// re-encoded from memory or inferred from `hasStoredProfilesOnDisk`:
+    /// memory is not always the file. `load()` drops entries it cannot use
+    /// and leaves a file it cannot parse on disk for the user to repair,
+    /// and a failed `save()` leaves memory ahead of it. Re-encoding would
+    /// overwrite either of those with what memory happened to hold.
+    func snapshot() -> Snapshot {
+        let file: Snapshot.File
+        if !fileManager.fileExists(atPath: storeURL.path) {
+            file = .absent
+        } else if let data = try? Data(contentsOf: storeURL) {
+            file = .bytes(data)
+        } else {
+            file = .unreadable
+        }
+        return Snapshot(profiles: profiles, file: file)
+    }
+
+    /// Put the store back as `snapshot()` found it: the same profiles in
+    /// memory and the same bytes on disk — or no file, if there was none
+    /// (Settings reads the file's existence as "voice profiles from an
+    /// earlier opt-in are still stored" and would offer to delete an
+    /// empty set).
+    ///
+    /// No deletion observers fire for the profiles this takes away. That
+    /// is only sound because the caller restores in the same synchronous
+    /// main-actor run that wrote them, so nothing can have seeded from
+    /// them in between; a caller that suspends between the two must not
+    /// use this.
+    ///
+    /// Returns whether the file was put back. On `false` (a failed write,
+    /// or a file that was unreadable at the snapshot) the error is logged,
+    /// memory is restored anyway, and the disk may still hold the writes
+    /// being undone.
+    @discardableResult
+    func restore(_ snapshot: Snapshot) -> Bool {
+        profiles = snapshot.profiles
+        var restored = true
+        do {
+            switch snapshot.file {
+            case .absent:
+                if fileManager.fileExists(atPath: storeURL.path) {
+                    try fileManager.removeItem(at: storeURL)
+                }
+            case .bytes(let data):
+                try data.write(to: storeURL, options: .atomic)
+            case .unreadable:
+                // Nothing to put back. Whatever was written since stays,
+                // and the caller has to hear that.
+                restored = false
+                profileLog.error("restore: speaker-profiles.json was unreadable at the snapshot, so it cannot be put back")
+            }
+        } catch {
+            restored = false
+            profileLog.error("restore: could not put speaker-profiles.json back: \(error.localizedDescription, privacy: .public)")
+        }
+        hasStoredProfilesOnDisk = fileManager.fileExists(atPath: storeURL.path)
+        if restored {
+            profileLog.log("restored \(snapshot.profiles.count) voice profiles from a snapshot")
+        }
+        return restored
+    }
+
     /// Rename a profile.
     func renameProfile(from oldName: String, to newName: String) {
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
