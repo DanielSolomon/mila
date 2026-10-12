@@ -74,11 +74,39 @@ public enum TranscriptFormatter {
             let seqNum = entries.count + 1
             // Same label resolution and `Name: text` shape as `plainText`,
             // so the cue prefix and the clipboard text cannot drift apart.
-            let line = format(speaker: seg.speaker.map { names[$0] ?? $0 }, text: text)
+            let line = format(speaker: seg.speaker.map { names[$0] ?? $0 }, text: cueText(text))
             entries.append("\(seqNum)\n\(srtTimestamp(seg.start)) --> \(srtTimestamp(seg.end))\n\(line)")
         }
         return entries
     }
+
+    /// `trimmedText` with no blank line left inside it. A blank line is
+    /// SRT's one and only cue delimiter, so a segment whose text carried an
+    /// interior `\n\n` — or a whitespace-only line, which lenient players
+    /// read as blank too — came back from the file as TWO cues, the second
+    /// with no number and no timing: strict players reject it, lenient ones
+    /// mis-time it. Empty and whitespace-only lines are dropped and the rest
+    /// rejoined with `\n`, so one segment is one cue whatever its text
+    /// carries. A line break on its own is a legal two-line cue and stays.
+    ///
+    /// Text with no line break in it is returned as-is — not re-split and
+    /// re-joined into equal bytes, the same `String` — which is what keeps
+    /// the app's `.srt` export unchanged for every segment whisper produces.
+    /// Every Unicode line terminator counts (`CharacterSet.newlines`: `\n`,
+    /// `\r`, VT, FF, NEL, U+2028, U+2029), not only the `\r`/`\n` an SRT
+    /// parser proper splits on: a reader built on a generic line splitter
+    /// such as Python's `str.splitlines()` breaks on all of them, so
+    /// `"a\u{2028}\u{2028}b"` would split the cue just as `"a\n\nb"` did.
+    /// Each surviving break rejoins as `\n`, the separator the rest of the
+    /// file already uses (so `\r\n` becomes `\n`).
+    static func cueText(_ trimmedText: String) -> String {
+        guard trimmedText.rangeOfCharacter(from: cueLineBreaks) != nil else { return trimmedText }
+        return trimmedText.components(separatedBy: cueLineBreaks)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            .joined(separator: "\n")
+    }
+
+    private static let cueLineBreaks = CharacterSet.newlines
 
     static func srtTimestamp(_ seconds: Double) -> String {
         // Round to whole milliseconds FIRST, then decompose. The previous
