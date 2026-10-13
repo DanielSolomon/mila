@@ -101,6 +101,24 @@ final class SettingsNavigation {
     /// use it to become real navigation instead of prose — see
     /// `AIFeaturesSettingsTab.notConfiguredBanner`.
     var pendingTab: SettingsTab?
+
+    /// Set alongside `pendingTab` to also scroll that destination to one
+    /// section. Consumed by `SettingsView.detailPane` once the destination
+    /// it belongs to is showing.
+    var pendingAnchor: SettingsAnchor?
+}
+
+/// A section inside a Settings destination that a deep link can scroll to.
+enum SettingsAnchor: String, Hashable {
+    /// Speakers → Voice recognition: where the damaged-profiles notice lives
+    /// (#336), and where the main window's announcement of it points (#342).
+    case voiceRecognition = "settings.anchor.voiceRecognition"
+
+    var tab: SettingsTab {
+        switch self {
+        case .voiceRecognition: return .speakers
+        }
+    }
 }
 
 /// Standard `Settings` scene. Opened via `Cmd+,` from the menu bar, and via
@@ -255,15 +273,32 @@ struct SettingsView: View {
     // MARK: Detail
 
     private var detailPane: some View {
-        Group {
+        // The destination this pane is built for. The anchor check below
+        // compares against it, not the live `selectedTab`: a deep link that
+        // switches destination changes both at once, and the outgoing pane
+        // must not consume an anchor that belongs to the incoming one.
+        let paneTab = selectedTab
+        return Group {
             if selectedTab.providesOwnScrollView {
                 destination
                     .padding(Self.detailInset)
             } else {
-                ScrollView(.vertical) {
-                    destination
-                        .padding(Self.detailInset)
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                ScrollViewReader { proxy in
+                    ScrollView(.vertical) {
+                        destination
+                            .padding(Self.detailInset)
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                    }
+                    // `initial`: a deep link that also switched the
+                    // destination arrives before this pane exists.
+                    .onChange(of: SettingsNavigation.shared.pendingAnchor, initial: true) { _, anchor in
+                        guard let anchor, anchor.tab == paneTab else { return }
+                        SettingsNavigation.shared.pendingAnchor = nil
+                        // Next turn, once the destination has laid out.
+                        DispatchQueue.main.async {
+                            withAnimation { proxy.scrollTo(anchor, anchor: .top) }
+                        }
+                    }
                 }
             }
         }
@@ -2443,6 +2478,7 @@ private struct DiarizationSettingsTabContent: View {
             Divider()
 
             VoiceRecognitionSection(diarization: diarization)
+                .id(SettingsAnchor.voiceRecognition)
 
             Spacer()
         }
@@ -2668,6 +2704,14 @@ private struct VoiceRecognitionSection: View {
     @EnvironmentObject private var settings: VoiceRecognitionSettings
     @EnvironmentObject private var profileStore: SpeakerProfileStore
     @State private var showDeleteConfirmation = false
+    /// Only a Settings window in front stands in for the main-window banner
+    /// (#342); one left open in the background does not.
+    @Environment(\.controlActiveState) private var controlActiveState
+
+    private func hideAnnouncementIfInFront() {
+        guard controlActiveState == .key, profileStore.damagedProfilesAnnouncement != nil else { return }
+        profileStore.hideDamagedProfilesAnnouncement()
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -2694,6 +2738,15 @@ private struct VoiceRecognitionSection: View {
 
             if let notice = profileStore.damagedProfilesNotice {
                 damagedProfilesNotice(notice)
+                    // Said here, so the main window need not say it too this
+                    // session (#342) — including an announcement raised
+                    // while this is already showing, e.g. by the toggle
+                    // above. Not recorded as seen: see
+                    // `hideDamagedProfilesAnnouncement`.
+                    .onChange(of: profileStore.damagedProfilesAnnouncement, initial: true) { _, _ in
+                        hideAnnouncementIfInFront()
+                    }
+                    .onChange(of: controlActiveState) { _, _ in hideAnnouncementIfInFront() }
             }
 
             if profileStore.hasStoredProfilesOnDisk {
