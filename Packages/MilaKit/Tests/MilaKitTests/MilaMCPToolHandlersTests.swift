@@ -257,6 +257,41 @@ final class MilaMCPToolHandlersTests: XCTestCase {
         XCTAssertEqual(result["summary"] as? String, "Quick sync.")
     }
 
+    /// While a re-transcription in the other language is in flight the app
+    /// has already switched `language` to the re-run's, but the text on disk
+    /// is still the earlier transcript. `language` must describe the text
+    /// returned (island-io/mila#330).
+    func test_get_transcript_reports_the_earlier_language_while_a_rerun_is_in_flight() throws {
+        var rerun = meeting("English meeting", daysAgo: 0)
+        rerun.status = "running"
+        rerun.language = "he"
+        rerun.retranscriptionPriorState = .init(status: "completed", language: "en",
+                                                modelName: "Earlier model")
+        var settled = meeting("Settled", daysAgo: 1)
+        settled.language = "he"
+        // A stale prior state on a settled row (a crash between writes) must
+        // not override the row's own language.
+        settled.retranscriptionPriorState = .init(status: "completed", language: "en")
+        // A re-run of a stopped partial draft: the kept text is not finished.
+        var draftRerun = meeting("Draft", daysAgo: 2)
+        draftRerun.status = "pending"
+        draftRerun.retranscriptionPriorState = .init(status: "failed", language: "en")
+        try seedStore([rerun, settled, draftRerun])
+
+        let inFlight = try call("get_transcript", ["id": rerun.id.uuidString])
+        XCTAssertEqual(inFlight["language"] as? String, "en")
+        XCTAssertEqual(inFlight["transcript"] as? String,
+                       "SPEAKER_00: shalom everyone\nSPEAKER_01: let's begin")
+        let note = inFlight["note"] as? String ?? ""
+        XCTAssertTrue(note.contains("re-transcription") && note.contains("finished"), note)
+
+        let draftNote = try call("get_transcript", ["id": draftRerun.id.uuidString])["note"] as? String ?? ""
+        XCTAssertTrue(draftNote.contains("may be partial") && !draftNote.contains("finished"), draftNote)
+
+        XCTAssertEqual(try call("get_transcript", ["id": settled.id.uuidString])["language"] as? String,
+                       "he")
+    }
+
     func test_get_transcript_max_chars_truncates() throws {
         try seedStore([meeting("Long", daysAgo: 0)])
         let result = try call("get_transcript", ["max_chars": 10])

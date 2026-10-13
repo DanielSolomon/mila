@@ -1324,7 +1324,11 @@ final class TranscriptionService: ObservableObject {
             // `speakerNames`/`segments`, which it never re-keyed. Merging onto
             // the live row also means a rename/re-file/soft-delete the user
             // made while the pass was failing survives (see `mergePassResult`).
-            mergePassResult(id: recording.id) { $0.status = .failed }
+            // A failed re-run is undone as a stop undoes it — the earlier
+            // transcript is still there, with its own status, language and
+            // model — and reported through `lastError` below
+            // (`Recording.settleFailedPass`).
+            mergePassResult(id: recording.id) { $0.settleFailedPass() }
             lastError = "Transcription failed: \(error.localizedDescription)"
         }
     }
@@ -1391,7 +1395,7 @@ final class TranscriptionService: ObservableObject {
     }
 
     private func markFailed(_ recording: Recording) {
-        mergePassResult(id: recording.id) { $0.status = .failed }
+        mergePassResult(id: recording.id) { $0.settleFailedPass() }
     }
 
     /// Whether the completion hook must force-regenerate the summary. True

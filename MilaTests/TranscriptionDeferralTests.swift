@@ -443,6 +443,83 @@ final class TranscriptionDeferralTests: XCTestCase {
         XCTAssertNil(try row(id).retranscriptionPriorState)
     }
 
+    /// A re-run in the other language that FAILS, rather than being stopped
+    /// (island-io/mila#330). The pass produced nothing, so the English
+    /// transcript is still there and the re-run is undone as a stop undoes
+    /// it: English, by the earlier model, still `.completed` (demoting an
+    /// intact transcript would switch off SRT, summaries and the MCP "latest
+    /// recording"). The failure is reported through `lastError`.
+    func test_a_failed_rerun_in_the_other_language_restores_the_finished_transcript() async throws {
+        let id = try makeFinished("English meeting", language: "en")
+        await stub.setNextError(LoadFailure())
+        guard let prepared = store.prepareForRetranscription(id: id, language: "he") else {
+            return XCTFail("recording vanished")
+        }
+        service.enqueue(prepared, isRetranscription: true)
+        await service.waitForIdle()
+
+        XCTAssertNotNil(service.lastError, "a genuine failure is still reported")
+        let restored = try row(id)
+        XCTAssertEqual(restored.status, .completed, "the kept transcript is still a finished one")
+        XCTAssertNil(restored.transcriptionDeferredAt)
+        XCTAssertEqual(restored.language, "en", "the kept transcript is English")
+        XCTAssertEqual(restored.modelName, "Earlier model", "…and was made by the earlier model")
+        XCTAssertEqual(restored.fullText, "an earlier, complete transcript")
+        XCTAssertNil(restored.retranscriptionPriorState, "settled: nothing left to undo")
+        XCTAssertNil(RecordingStore(rootDirectory: tempRoot).recordings
+                        .first { $0.id == id }?.retranscriptionPriorState,
+                     "…and the consumption is persisted")
+    }
+
+    /// `settleFailedPass` undoes only an in-flight re-run whose earlier
+    /// transcript is still there, and consumes the prior state in every case.
+    func test_settling_a_failed_pass_undoes_only_a_rerun_with_a_kept_transcript() {
+        let before = Recording.RetranscriptionPriorState(
+            status: .completed, language: "en", modelName: "Earlier model", transcriptionDeferredAt: nil)
+        var rerun = Recording(title: "t", source: .microphone, audioFileName: "t.wav",
+                              status: .running, language: "he", modelName: "Re-run model",
+                              fullText: "an earlier transcript", retranscriptionPriorState: before)
+        XCTAssertTrue(rerun.isRetranscriptionInFlight)
+        XCTAssertEqual(rerun.transcriptLanguage, "en", "the text on the row is still the English one")
+
+        // A stale prior state on a settled row describes nothing.
+        var settled = rerun
+        settled.status = .completed
+        XCTAssertFalse(settled.isRetranscriptionInFlight)
+        XCTAssertEqual(settled.transcriptLanguage, "he")
+        XCTAssertFalse(settled.restoreRetranscriptionPriorState())
+        XCTAssertEqual(settled.language, "he")
+
+        var noTranscript = rerun
+        noTranscript.fullText = ""
+        noTranscript.settleFailedPass()
+        XCTAssertEqual(noTranscript.status, .failed)
+        XCTAssertEqual(noTranscript.language, "he", "nothing kept for the earlier labels to describe")
+        XCTAssertNil(noTranscript.retranscriptionPriorState)
+
+        var firstPass = rerun
+        firstPass.retranscriptionPriorState = nil
+        firstPass.settleFailedPass()
+        XCTAssertEqual(firstPass.status, .failed)
+        XCTAssertEqual(firstPass.language, "he")
+
+        // A re-run of a stopped live draft goes back to reading as stopped.
+        var stoppedDraft = rerun
+        let stoppedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        stoppedDraft.retranscriptionPriorState = .init(
+            status: .failed, language: "en", modelName: nil, transcriptionDeferredAt: stoppedAt)
+        stoppedDraft.settleFailedPass()
+        XCTAssertEqual(stoppedDraft.status, .failed)
+        XCTAssertEqual(stoppedDraft.transcriptionDeferredAt, stoppedAt)
+        XCTAssertEqual(stoppedDraft.language, "en")
+
+        rerun.settleFailedPass()
+        XCTAssertEqual(rerun.status, .completed)
+        XCTAssertEqual(rerun.language, "en")
+        XCTAssertEqual(rerun.modelName, "Earlier model")
+        XCTAssertNil(rerun.retranscriptionPriorState)
+    }
+
     /// A chunk-mode live draft waiting on its first full pass has text but was
     /// never transcribed properly. Stopping it must not pass it off as
     /// finished (`.completed` would skip the SRT/summary/compression only a
