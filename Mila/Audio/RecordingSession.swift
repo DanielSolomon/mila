@@ -130,7 +130,12 @@ final class RecordingSession: ObservableObject {
         system.selectedApp = app
     }
 
-    func start(source: RecordingSource, outputURL: URL) async throws {
+    /// `cancellation` is handed to each capture leg's bring-up, which throws
+    /// `CaptureStartCancellation.Cancelled` rather than open capture once it
+    /// is tripped; the partial-bring-up teardown below then runs as for any
+    /// other failure (#328).
+    func start(source: RecordingSource, outputURL: URL,
+               cancellation: CaptureStartCancellation? = nil) async throws {
         guard state == .idle else { return }
         self.source = source
         self.fileURL = outputURL
@@ -160,7 +165,7 @@ final class RecordingSession: ObservableObject {
 
             if source == .microphone || source == .meeting {
                 _ = await mic.requestAccess()
-                try await mic.start()
+                try await mic.start(cancellation: cancellation)
                 micTask = Task { [weak self] in
                     guard let self else { return }
                     for await buf in self.mic.audioStream {
@@ -170,7 +175,7 @@ final class RecordingSession: ObservableObject {
             }
 
             if source == .systemAudio || source == .meeting {
-                try await system.start()
+                try await system.start(cancellation: cancellation)
                 systemTask = Task { [weak self] in
                     guard let self else { return }
                     for await buf in self.system.audioStream {
@@ -192,12 +197,19 @@ final class RecordingSession: ObservableObject {
             // here (Screen Recording permission denied) is fully described by
             // the source + domain + code, which stay public. (Issue #213.)
             let ns = error as NSError
-            recLog.error("""
-                start(\(source.rawValue, privacy: .public)) failed mid-bring-up \
-                — tearing down partial session \
-                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
-                \(error.localizedDescription, privacy: .private)
-                """)
+            if error is CaptureStartCancellation.Cancelled {
+                // Deliberate (sleep / lock during Starting…, #328), not a
+                // bring-up failure — keep it out of the error-level lines a
+                // diagnostic report is triaged by.
+                recLog.log("start(\(source.rawValue, privacy: .public)) cancelled before capture opened — tearing down partial session")
+            } else {
+                recLog.error("""
+                    start(\(source.rawValue, privacy: .public)) failed mid-bring-up \
+                    — tearing down partial session \
+                    [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                    \(error.localizedDescription, privacy: .private)
+                    """)
+            }
             micTask?.cancel(); micTask = nil
             systemTask?.cancel(); systemTask = nil
             await mic.stop()
