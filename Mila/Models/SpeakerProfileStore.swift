@@ -236,7 +236,36 @@ final class SpeakerProfileStore: ObservableObject {
     /// a stale copy of `profiles`, so the next `save()` moves it aside
     /// rather than writing over it (#329). Cleared once it has been moved,
     /// deleted by the user, or loaded successfully.
-    private(set) var loadedFromDamagedFile = false
+    private(set) var loadedFromDamagedFile = false {
+        // A change to it changes what Settings must say (#336). `init`
+        // refreshes unconditionally on its own, since a load that leaves
+        // this false does not fire here.
+        didSet { if loadedFromDamagedFile != oldValue { refreshDamagedProfilesNotice() } }
+    }
+
+    /// What Settings tells the user about voice profiles that could not be
+    /// loaded (#336). Without it the profiles just vanish from recognition
+    /// and the only trace is a log line.
+    enum DamagedProfilesNotice: Equatable {
+        /// `speaker-profiles.json` could not be read or parsed, so none of
+        /// its profiles are in use. Still at its own path; the next write
+        /// moves it aside.
+        case unreadable(URL)
+        /// A file that could not be read was kept as this backup.
+        case setAside(URL)
+
+        var fileURL: URL {
+            switch self {
+            case .unreadable(let url), .setAside(let url): return url
+            }
+        }
+    }
+
+    /// Recomputed only by `refreshDamagedProfilesNotice()` — on load, on a
+    /// move aside, on opt-out, on delete, on dismiss and when Settings
+    /// rechecks — so this is a once-in-a-while publish, safe on an
+    /// App-level `@StateObject` (see CLAUDE.md).
+    @Published private(set) var damagedProfilesNotice: DamagedProfilesNotice?
 
     /// What a deletion removed, handed to the observers below.
     enum Deletion: Equatable {
@@ -297,6 +326,7 @@ final class SpeakerProfileStore: ObservableObject {
         // embedding reaches memory, so nothing can be seeded or matched
         // even by a caller that forgot its own guard.
         if settings.isEnabled { load() }
+        refreshDamagedProfilesNotice()
         // Toggling mid-session has to take effect without a relaunch:
         // opting in loads what was stored, opting out drops it again.
         settings.addEnabledObserver { [weak self] nowEnabled in
@@ -305,6 +335,8 @@ final class SpeakerProfileStore: ObservableObject {
                 self.load()
             } else {
                 self.profiles.removeAll()
+                // Whatever failed to save is gone from memory too.
+                self.hasUnsavedChanges = false
             }
         }
     }
@@ -502,6 +534,7 @@ final class SpeakerProfileStore: ObservableObject {
     /// notification is what completes the cleanup.
     func deleteAllProfiles() {
         profiles.removeAll()
+        hasUnsavedChanges = false
         do {
             if fileManager.fileExists(atPath: storeURL.path) {
                 try fileManager.removeItem(at: storeURL)
@@ -521,6 +554,13 @@ final class SpeakerProfileStore: ObservableObject {
             }
         }
         hasStoredProfilesOnDisk = storedFilesExist()
+        // The backups are gone, so the names dismissed for them are moot —
+        // and must not hide a later backup that happens to reuse one.
+        // Keep only names whose file survived a failed removal, so that one
+        // does not come back as if never dismissed.
+        let surviving = Set(damagedCopies().map(\.lastPathComponent))
+        settings.setDismissedDamagedBackups(settings.dismissedDamagedBackups.intersection(surviving))
+        refreshDamagedProfilesNotice()
         // Unconditional, and after the file is gone: this must fire even
         // when `profiles` was already empty in memory (the feature is off,
         // so the file was never parsed) — that is precisely the case where
@@ -785,6 +825,7 @@ final class SpeakerProfileStore: ObservableObject {
         // Move it out of the way first; if that fails, do not write at all.
         if loadedFromDamagedFile, !moveDamagedFileAside() {
             profileLog.error("save skipped — the damaged speaker-profiles.json could not be moved aside")
+            hasUnsavedChanges = true
             return false
         }
         let encoder = JSONEncoder()
@@ -798,16 +839,123 @@ final class SpeakerProfileStore: ObservableObject {
             }
             let data = try encoder.encode(profiles)
             try data.write(to: storeURL, options: .atomic)
+            lastSeenFileDate = currentFileDate()
+            hasUnsavedChanges = false
             hasStoredProfilesOnDisk = true
             return true
         } catch {
             profileLog.log("save error: \(error.localizedDescription, privacy: .public)")
+            hasUnsavedChanges = true
             hasStoredProfilesOnDisk = storedFilesExist()
             return false
         }
     }
 
     private static let damagedPrefix = "speaker-profiles.damaged-"
+
+    /// Hide the notice for every backup present now; remembered by file
+    /// name, so a later damaged file still gets its own notice. Replacing
+    /// the whole list also forgets names whose files are gone. The backups
+    /// themselves are left alone. An `.unreadable` notice cannot be
+    /// dismissed: it clears once the file is moved aside, repaired, or
+    /// deleted (see `recheckDamagedProfiles`).
+    func dismissDamagedProfilesNotice() {
+        guard case .setAside = damagedProfilesNotice else { return }
+        settings.setDismissedDamagedBackups(Set(damagedCopies().map(\.lastPathComponent)))
+        refreshDamagedProfilesNotice()
+    }
+
+    /// Bring the notice up to date with what is on disk now. Settings calls
+    /// it when it appears and whenever Mila becomes active again — the
+    /// notice's own "Show in Finder" invites the user to delete a backup or
+    /// repair the live file there, which nothing here would otherwise see.
+    ///
+    /// The live file is re-read only when it is not the one this store last
+    /// read or wrote (`lastSeenFileDate`), so a still-broken file is not
+    /// re-parsed on every focus change, and a repaired one — including a
+    /// backup the user fixed and put back over the file `save()` wrote — is
+    /// loaded instead of being overwritten by the next save. Never while a
+    /// change exists only in memory (`hasUnsavedChanges`: its save failed),
+    /// which a re-read would drop. Profiles the re-read removes are
+    /// reported to the deletion observers, exactly as a delete from
+    /// Settings is, so a recording in flight does not write them back.
+    ///
+    /// While the feature is off the file is never parsed, so a changed
+    /// file just clears the unreadable state; opting in re-detects it.
+    func recheckDamagedProfiles() {
+        let date = currentFileDate()
+        if date == nil {
+            // Removed by hand. If it held profiles this store had read or
+            // written, memory must follow — otherwise Settings hides
+            // "Delete Voice Profiles" while the next save writes the
+            // voices straight back.
+            if lastSeenFileDate != nil, settings.isEnabled, !hasUnsavedChanges {
+                let removed = Set(profiles.map(\.name))
+                profiles.removeAll()
+                if !removed.isEmpty { notifyDeleted(.named(removed)) }
+            }
+            lastSeenFileDate = nil
+            loadedFromDamagedFile = false
+        } else if date != lastSeenFileDate, !hasUnsavedChanges {
+            if settings.isEnabled {
+                let before = Set(profiles.map(\.name))
+                load()
+                let removed = before.subtracting(profiles.map(\.name))
+                if !removed.isEmpty { notifyDeleted(.named(removed)) }
+            } else {
+                loadedFromDamagedFile = false
+            }
+        }
+        // Forget dismissals of backups the user removed by hand, so a later
+        // backup that reuses a name is still announced.
+        let present = Set(damagedCopies().map(\.lastPathComponent))
+        let dismissed = settings.dismissedDamagedBackups
+        if !dismissed.isSubset(of: present) {
+            settings.setDismissedDamagedBackups(dismissed.intersection(present))
+        }
+        refreshDamagedProfilesNotice()
+        let stored = storedFilesExist()
+        // Unconditional assignment would publish on every app activation.
+        if stored != hasStoredProfilesOnDisk { hasStoredProfilesOnDisk = stored }
+    }
+
+    /// A change that `save()` could not write (the damaged file could not
+    /// be moved aside, or the write failed). Blocks a recheck's re-read.
+    private var hasUnsavedChanges = false
+
+    /// Modification date of the live file this store last read or wrote.
+    private var lastSeenFileDate: Date?
+
+    private func currentFileDate() -> Date? {
+        (try? fileManager.attributesOfItem(atPath: storeURL.path))?[.modificationDate] as? Date
+    }
+
+    /// Order of a backup's name: `<prefix><stamp>[-<n>].json`. The stamp is
+    /// fixed-width UTC, so it compares as a string; the collision suffix
+    /// does not (`-` sorts before `.`, and `-10` before `-2`), so it is
+    /// compared as a number, with no suffix meaning 1.
+    private static func backupOrder(_ url: URL) -> (String, Int) {
+        let core = url.deletingPathExtension().lastPathComponent.dropFirst(damagedPrefix.count)
+        let parts = core.split(separator: "-", maxSplits: 1)
+        let attempt = parts.count > 1 ? Int(parts[1]) ?? 1 : 1
+        return (String(parts.first ?? ""), attempt)
+    }
+
+    /// The newest backup the user has not dismissed, unless the live file
+    /// itself is unreadable right now — that is the more urgent message.
+    private func refreshDamagedProfilesNotice() {
+        let notice: DamagedProfilesNotice?
+        if loadedFromDamagedFile {
+            notice = .unreadable(storeURL)
+        } else {
+            let dismissed = settings.dismissedDamagedBackups
+            notice = damagedCopies()
+                .filter { !dismissed.contains($0.lastPathComponent) }
+                .max { Self.backupOrder($0) < Self.backupOrder($1) }
+                .map(DamagedProfilesNotice.setAside)
+        }
+        if damagedProfilesNotice != notice { damagedProfilesNotice = notice }
+    }
 
     /// The copies `moveDamagedFileAside()` left next to the live file.
     private func damagedCopies() -> [URL] {
@@ -889,10 +1037,12 @@ final class SpeakerProfileStore: ObservableObject {
     private func load() {
         guard settings.isEnabled else { return }
         guard fileManager.fileExists(atPath: storeURL.path) else {
+            lastSeenFileDate = nil
             loadedFromDamagedFile = false
             return
         }
         do {
+            lastSeenFileDate = currentFileDate()
             let data = try Data(contentsOf: storeURL)
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
@@ -907,6 +1057,7 @@ final class SpeakerProfileStore: ObservableObject {
                 accepted.append(profile)
             }
             profiles = accepted
+            hasUnsavedChanges = false
             loadedFromDamagedFile = false
             profileLog.log("loaded \(accepted.count) of \(decoded.count) voice profiles")
         } catch {

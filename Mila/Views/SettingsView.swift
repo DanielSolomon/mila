@@ -2692,6 +2692,10 @@ private struct VoiceRecognitionSection: View {
                     .accessibilityIdentifier("speakers.voiceRecognition.waiting")
             }
 
+            if let notice = profileStore.damagedProfilesNotice {
+                damagedProfilesNotice(notice)
+            }
+
             if profileStore.hasStoredProfilesOnDisk {
                 Divider()
                 HStack(alignment: .firstTextBaseline) {
@@ -2716,12 +2720,63 @@ private struct VoiceRecognitionSection: View {
                 }
             }
         }
+        // The notice's "Show in Finder" sends the user off to fix things by
+        // hand; look again when they come back (#336).
+        .onAppear { profileStore.recheckDamagedProfiles() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            profileStore.recheckDamagedProfiles()
+        }
+    }
+
+    /// The profiles file could not be read (#336). Without this the voices
+    /// just stop being recognised and the backup sits unannounced in
+    /// Application Support. Same orange callout as the other warnings here.
+    private func damagedProfilesNotice(_ notice: SpeakerProfileStore.DamagedProfilesNotice) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(damagedProfilesMessage(notice))
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Button("Show in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([notice.fileURL])
+                    }
+                    .accessibilityIdentifier("speakers.voiceRecognition.damaged.showInFinder")
+                    if case .setAside = notice {
+                        Button("Dismiss") { profileStore.dismissDamagedProfilesNotice() }
+                            .accessibilityIdentifier("speakers.voiceRecognition.damaged.dismiss")
+                    }
+                }
+                .font(.caption)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("speakers.voiceRecognition.damaged")
+    }
+
+    private func damagedProfilesMessage(_ notice: SpeakerProfileStore.DamagedProfilesNotice) -> String {
+        switch notice {
+        case .unreadable(let file):
+            return "Your saved voice profiles couldn't be loaded: \(file.lastPathComponent) can't be read, so nobody it describes will be recognised. The file is left untouched — before Mila writes any new voice profile, it renames this one to keep it as a backup."
+        case .setAside(let backup):
+            return "Your previous voice profiles couldn't be loaded, so speakers saved before then are no longer recognised. The unreadable file was kept as a backup: \(backup.lastPathComponent)."
+        }
     }
 
     /// While the feature is off the profiles file is deliberately never
     /// parsed, so there is no count to show — only the fact that it exists.
     private var storedProfilesLabel: String {
         guard settings.isEnabled else {
+            // The file that failed to load is not "where you left off"; the
+            // notice above says what happened to it.
+            if case .unreadable = profileStore.damagedProfilesNotice {
+                return "Voice profile files are still stored on this Mac. They are only removed if you remove them."
+            }
             return "Voice profiles from an earlier session are still stored on this Mac. Turning the switch back on picks up where you left off; they are only removed if you remove them."
         }
         let n = profileStore.profiles.count

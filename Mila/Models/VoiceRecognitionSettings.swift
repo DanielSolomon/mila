@@ -24,6 +24,7 @@ final class VoiceRecognitionSettings: ObservableObject {
 
     enum Keys {
         static let enabled = "speakers.voiceRecognition.enabled"
+        static let dismissedDamagedBackups = "speakers.voiceRecognition.dismissedDamagedBackups"
     }
 
     /// Master switch. **Off by default** and deliberately not inferred from
@@ -181,6 +182,23 @@ final class VoiceRecognitionSettings: ObservableObject {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         self.isEnabled = defaults.bool(forKey: Keys.enabled)
+    }
+
+    /// File names of `speaker-profiles.damaged-*.json` backups whose Settings
+    /// notice the user dismissed (#336). Kept here, on this object's own
+    /// suite, so tests never touch `.standard`. Names only — no voice data.
+    /// Deliberately not `@Published`: `SpeakerProfileStore` republishes its
+    /// notice when one is dismissed, and nothing else reads this.
+    var dismissedDamagedBackups: Set<String> {
+        Set(defaults.stringArray(forKey: Keys.dismissedDamagedBackups) ?? [])
+    }
+
+    func setDismissedDamagedBackups(_ fileNames: Set<String>) {
+        if fileNames.isEmpty {
+            defaults.removeObject(forKey: Keys.dismissedDamagedBackups)
+        } else {
+            defaults.set(fileNames.sorted(), forKey: Keys.dismissedDamagedBackups)
+        }
     }
 
     /// **The gate.** True iff voice recognition is switched on *and* able to
