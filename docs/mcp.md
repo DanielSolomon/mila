@@ -7,7 +7,9 @@ live transcript of a meeting **while it's still happening**.
 
 Everything stays local: the server reads Mila's own on-disk store; no
 audio or text leaves your Mac unless you ask Claude to do something
-with it.
+with it. Its one write is `save_transcript`, which saves a transcript to
+a file you (or Claude, on your behalf) name — it never changes Mila's own
+data.
 
 ## Turn it on first
 
@@ -69,6 +71,7 @@ cp -R skills/mila-meetings ~/.claude/skills/
 |---|---|
 | `list_recordings` | List/filter recordings — by speaker display name, title/app/folder text, source, date range; sortable by date/duration/title. A row whose transcription the user stopped to run later carries `transcription_stopped: true` (its `status` reads `failed`, but nothing failed). |
 | `get_transcript` | One recording's full speaker-named transcript + summary + action items. Omit `id` for the latest completed recording. Trashed recordings are not reachable, by id or otherwise. `format: "srt"` returns SubRip subtitles instead (one timed cue per segment, speaker names as cue prefixes — byte-identical to the app's **Export Subtitles (.srt)**); it is refused for recordings that have no timed segments, and `max_chars` then drops whole cues rather than cutting one. Each action item carries a `source` — `voice_command` (the speaker dictated it out loud) or `inferred` (Live AI derived it from the conversation). Those are not the same claim, so a client should not present the second as the first. |
+| `save_transcript` | Writes one recording's complete transcript (`text` or `srt`) to a file and replies with `saved_to` / `bytes` instead of the text. The only tool that writes, kept separate so a client asks for permission to use it on its own. See [Saving to a file](#saving-to-a-file-save_transcript). |
 | `search_transcripts` | Full-text search over titles + transcripts with context snippets; relevance or date sort. |
 | `get_live_transcript` | The in-progress recording's transcript, with a polling cursor for cheap deltas. |
 
@@ -106,8 +109,32 @@ Claude calls `list_recordings(speaker: "john doe", limit: 1)` and then
 assigned in Mila's rename popover — unnamed speakers stay `SPEAKER_NN`.
 
 For subtitles — "export my last meeting as an .srt next to the video" —
-Claude calls `get_transcript(id: …, format: "srt")` and writes the result
-to a file. The cues are the same ones the app's own export produces.
+Claude calls `save_transcript(id: …, format: "srt", path: "<folder>")`.
+The cues are the same ones the app's own export produces.
+
+### Saving to a file (`save_transcript`)
+
+`save_transcript(path: …)` writes the complete transcript (text or SRT)
+to disk from the helper itself and replies with `saved_to`, `bytes` and
+`characters` in place of the transcript text. Use it whenever the end
+product is a file. The alternative — fetch the text, have the model write
+it out — makes the model re-generate every character as output tokens;
+Hebrew runs close to one token per character, so a 40 KB transcript of a
+20-minute meeting took about three minutes per file that way, against
+milliseconds here.
+
+- `path` is an absolute path (`~` is expanded) or an existing folder,
+  which gets `<date> <title>.txt` / `.srt`. The parent folder must exist.
+- An existing file is refused unless `overwrite: true`; the refusal is
+  atomic, so a file that appears mid-write is not replaced either.
+- There is no `max_chars`: a saved file is always complete.
+- It is a separate tool from `get_transcript` on purpose. Clients ask
+  permission per tool, so having always-allowed reading transcripts does
+  not also allow writing files.
+- Paths inside Mila's own data (the app-support folder, and a relocated
+  recordings folder) are refused, so an export can never clobber
+  `recordings.json` or a sidecar. Like the access toggle, these checks
+  prevent accidents; the helper runs as you and is not a sandbox.
 
 ## Following a live meeting
 

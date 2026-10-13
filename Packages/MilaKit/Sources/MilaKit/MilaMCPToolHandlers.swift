@@ -123,6 +123,8 @@ public struct MilaMCPToolHandlers: Sendable {
             save them to a .srt file rather than quoting them. With "srt", max_chars \
             drops whole cues from the end so the result stays a valid file — omit it \
             for the complete file, and check transcript_truncated before saving one.
+            To put a transcript in a file, use save_transcript instead of writing this \
+            tool's text out yourself.
             """,
             inputSchema: [
                 "type": "object",
@@ -136,6 +138,35 @@ public struct MilaMCPToolHandlers: Sendable {
                     "max_chars": ["type": "integer",
                                   "description": "Truncate the transcript to this many characters (whole cues only for srt)."],
                 ],
+            ]
+        ),
+        ToolSpec(
+            name: "save_transcript",
+            description: """
+            Write one recording's complete transcript to a file on this Mac — Mila writes \
+            it directly, and the reply carries saved_to and bytes, NOT the text. Use this \
+            whenever the transcript should end up in a file (export, upload, attach, \
+            subtitles next to a video) instead of fetching it with get_transcript and \
+            writing it out yourself: re-emitting a long transcript costs minutes of \
+            generation, this costs milliseconds. format "text" (default) is the \
+            speaker-named transcript; "srt" is SubRip subtitles, the same bytes as \
+            get_transcript's srt and Mila's Export Subtitles. path may name a file or an \
+            existing folder (the file is then named "<date> <title>.txt" or ".srt"). An \
+            existing file is refused unless overwrite is true — ask the user first.
+            """,
+            inputSchema: [
+                "type": "object",
+                "properties": [
+                    "path": ["type": "string",
+                             "description": "Absolute path (~ allowed) of the file to write, or of an existing folder to write into. The parent folder must exist. Paths inside Mila's own data are refused."],
+                    "id": ["type": "string",
+                           "description": "Recording UUID. Omit for the latest completed recording."],
+                    "format": ["type": "string", "enum": ["text", "srt"],
+                               "description": "text (default) or srt. srt is unavailable for recordings without timed segments."],
+                    "overwrite": ["type": "boolean",
+                                  "description": "Replace an existing file (default false: an existing file is an error)."],
+                ],
+                "required": ["path"],
             ]
         ),
         ToolSpec(
@@ -206,6 +237,7 @@ public struct MilaMCPToolHandlers: Sendable {
         switch tool {
         case "list_recordings": return try listRecordings(arguments)
         case "get_transcript": return try getTranscript(arguments)
+        case "save_transcript": return try saveTranscript(arguments)
         case "search_transcripts": return try searchTranscripts(arguments)
         case "get_live_transcript": return try getLiveTranscript(arguments)
         default: throw ToolError.unknownTool(tool)
@@ -245,7 +277,85 @@ public struct MilaMCPToolHandlers: Sendable {
         // hide behind an unknown `id` or cost a recordings.json load first.
         let format = try enumArg(args, "format", TranscriptFormat.self) ?? .text
         let maxChars = args["max_chars"] as? Int
-        let recording: StoredRecording
+        let recording = try resolveRecording(args)
+        let rendered = try renderTranscript(recording, format: format, maxChars: maxChars)
+
+        var result = summaryObject(for: recording)
+        // The language of the text returned, not of a re-run still in flight.
+        result["language"] = recording.transcriptLanguage
+        result["format"] = format.rawValue
+        result["transcript"] = rendered.text
+        result["transcript_truncated"] = rendered.truncated
+        var notes = statusNotes(for: recording)
+        if let sizeHint = rendered.sizeHint { notes.append(sizeHint) }
+        if !notes.isEmpty { result["note"] = notes.joined(separator: " ") }
+        if (args["include_summary"] as? Bool) ?? true {
+            if let summary = recording.summary, !summary.isEmpty {
+                result["summary"] = summary
+            }
+            if let items = recording.actionItems, !items.isEmpty {
+                result["action_items"] = items.map { item in
+                    var obj: [String: Any] = ["text": item.text]
+                    if let speaker = item.speaker {
+                        obj["speaker"] = recording.speakerNames[speaker] ?? speaker
+                    }
+                    // `voice_command` (the speaker dictated the item) vs
+                    // `inferred` (the model derived it). Without this the
+                    // two are indistinguishable and every item reads as
+                    // equally authoritative — see StoredRecording.ActionItem.
+                    if !item.source.isEmpty { obj["source"] = item.source }
+                    if let seconds = item.timestampSeconds {
+                        obj["timestamp_seconds"] = seconds
+                    }
+                    return obj
+                }
+            }
+        }
+        return try json(result)
+    }
+
+    /// Writes the transcript to disk from the helper and replies with where
+    /// it went, never with the text — see `TranscriptFileWriter` for why.
+    ///
+    /// A separate tool from `get_transcript` on purpose. MCP clients ask
+    /// permission per tool NAME, and a user who has "always allowed" a
+    /// read-only `get_transcript` has not agreed to let a client create or
+    /// replace files on their Mac. Folding writes into that tool would have
+    /// extended the standing approval silently; as its own tool, the first
+    /// write prompts on its own.
+    private func saveTranscript(_ args: [String: Any]) throws -> String {
+        let format = try enumArg(args, "format", TranscriptFormat.self) ?? .text
+        guard let path = args["path"] as? String, !path.isEmpty else {
+            throw ToolError.invalidArguments("path is required")
+        }
+        let overwrite = (args["overwrite"] as? Bool) ?? false
+        let recording = try resolveRecording(args)
+        // No `max_chars`: a file is only useful complete, and a truncated
+        // `.srt` is a subtitle track that silently stops early.
+        let rendered = try renderTranscript(recording, format: format, maxChars: nil)
+
+        let writer = TranscriptFileWriter(protectedDirectories: protectedDirectories())
+        let defaultName = TranscriptFileWriter.defaultFileName(
+            title: recording.title, createdAt: recording.createdAt,
+            fileExtension: format == .srt ? "srt" : "txt")
+        var result = summaryObject(for: recording)
+        result["format"] = format.rawValue
+        do {
+            let destination = try writer.destination(for: path, defaultFileName: defaultName)
+            result["bytes"] = try writer.write(rendered.text, to: destination, overwrite: overwrite)
+            result["saved_to"] = destination.path
+        } catch let error as TranscriptFileWriter.WriteError {
+            throw ToolError.invalidArguments(error.description)
+        }
+        result["characters"] = rendered.text.count
+        let notes = statusNotes(for: recording)
+        if !notes.isEmpty { result["note"] = notes.joined(separator: " ") }
+        return try json(result)
+    }
+
+    /// `id` → that recording (trashed ones are unreachable, via the reader);
+    /// no `id` → the latest completed one.
+    private func resolveRecording(_ args: [String: Any]) throws -> StoredRecording {
         do {
             if let idString = args["id"] as? String {
                 guard let id = UUID(uuidString: idString) else {
@@ -254,24 +364,32 @@ public struct MilaMCPToolHandlers: Sendable {
                 guard let found = try source.recording(id: id) else {
                     throw ToolError.notFound("No recording with id \(id.uuidString)")
                 }
-                recording = found
-            } else {
-                guard let latest = try source.latestCompletedRecording() else {
-                    throw ToolError.notFound("No completed recordings exist yet")
-                }
-                recording = latest
+                return found
             }
+            guard let latest = try source.latestCompletedRecording() else {
+                throw ToolError.notFound("No completed recordings exist yet")
+            }
+            return latest
         } catch let error as ToolError {
             throw error
         } catch {
             throw ToolError.storeUnavailable(String(describing: error))
         }
+    }
 
+    private struct RenderedTranscript {
+        var text: String
+        var truncated: Bool
+        /// Set only when `max_chars` is too small for even the first SRT cue:
+        /// `transcript: ""` + `transcript_truncated: true` is the right answer
+        /// there, but on its own it gives the client nothing to act on.
+        var sizeHint: String?
+    }
+
+    private func renderTranscript(_ recording: StoredRecording, format: TranscriptFormat,
+                                  maxChars: Int?) throws -> RenderedTranscript {
         var transcript: String
         var truncated = false
-        // Set only when `max_chars` is too small for even the first SRT cue:
-        // `transcript: ""` + `transcript_truncated: true` is the right answer
-        // there, but on its own it gives the client nothing to act on.
         var sizeHint: String?
         switch format {
         case .text:
@@ -333,52 +451,36 @@ public struct MilaMCPToolHandlers: Sendable {
             }
             transcript = TranscriptFormatter.srt(cues: kept)
         }
-        var result = summaryObject(for: recording)
-        // The language of the text returned, not of a re-run still in flight.
-        result["language"] = recording.transcriptLanguage
-        result["format"] = format.rawValue
-        result["transcript"] = transcript
-        result["transcript_truncated"] = truncated
-        var notes: [String] = []
+        return RenderedTranscript(text: transcript, truncated: truncated, sizeHint: sizeHint)
+    }
+
+    private func statusNotes(for recording: StoredRecording) -> [String] {
         if recording.isTranscriptionDeferred {
             // Stored as `failed` (see `StoredRecording.transcriptionDeferredAt`),
             // but nothing failed: the user chose to transcribe it later.
-            notes.append("The user stopped this recording's transcription in Mila to run it later, so it hasn't been fully transcribed — any text here is only a partial live draft.")
-        } else if recording.isRetranscriptionInFlight {
+            return ["The user stopped this recording's transcription in Mila to run it later, so it hasn't been fully transcribed — any text here is only a partial live draft."]
+        }
+        if recording.isRetranscriptionInFlight {
             // The earlier transcript is finished only if it was `completed`:
             // it can also be a stopped or failed partial draft.
             let earlier = recording.retranscriptionPriorState?.status == "completed"
                 ? "the earlier, finished transcript"
                 : "the earlier transcript, which may be partial"
-            notes.append("A re-transcription of this recording is in progress; this is \(earlier), which it will replace when it completes.")
-        } else if recording.status != "completed" {
-            notes.append("Transcription status is \"\(recording.status)\" — the transcript may be partial.")
+            return ["A re-transcription of this recording is in progress; this is \(earlier), which it will replace when it completes."]
         }
-        if let sizeHint { notes.append(sizeHint) }
-        if !notes.isEmpty { result["note"] = notes.joined(separator: " ") }
-        if (args["include_summary"] as? Bool) ?? true {
-            if let summary = recording.summary, !summary.isEmpty {
-                result["summary"] = summary
-            }
-            if let items = recording.actionItems, !items.isEmpty {
-                result["action_items"] = items.map { item in
-                    var obj: [String: Any] = ["text": item.text]
-                    if let speaker = item.speaker {
-                        obj["speaker"] = recording.speakerNames[speaker] ?? speaker
-                    }
-                    // `voice_command` (the speaker dictated the item) vs
-                    // `inferred` (the model derived it). Without this the
-                    // two are indistinguishable and every item reads as
-                    // equally authoritative — see StoredRecording.ActionItem.
-                    if !item.source.isEmpty { obj["source"] = item.source }
-                    if let seconds = item.timestampSeconds {
-                        obj["timestamp_seconds"] = seconds
-                    }
-                    return obj
-                }
-            }
+        if recording.status != "completed" {
+            return ["Transcription status is \"\(recording.status)\" — the transcript may be partial."]
         }
-        return try json(result)
+        return []
+    }
+
+    /// Where `save_transcript` may not write: the app-support root (consent
+    /// and pointer files, the live sidecar, the default store) and the store
+    /// the pointer resolves to, which a relocation can put anywhere.
+    private func protectedDirectories() -> [URL] {
+        let location = MilaStoreReader.resolvedLocation(root: root)
+        return [root, location.recordingsDirectory,
+                location.storeFileURL.deletingLastPathComponent()]
     }
 
     private func searchTranscripts(_ args: [String: Any]) throws -> String {

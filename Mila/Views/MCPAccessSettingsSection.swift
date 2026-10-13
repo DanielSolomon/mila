@@ -82,12 +82,12 @@ struct MCPAccessSettingsSection: View {
                 Spacer()
             }
             if settings.enabled {
-                Text("An MCP client on this Mac — Claude Code or Claude Desktop — can list your recordings, read their transcripts, search them, and follow a recording as it happens. Nothing is sent anywhere by Mila; the client you register decides what it does with the text.")
+                Text("An MCP client on this Mac — Claude Code or Claude Desktop — can list your recordings, read their transcripts, search them, follow a recording as it happens, and save a transcript to a file you name. Nothing is sent anywhere by Mila; the client you register decides what it does with the text.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                Text("Off. Turn this on to let an MCP client on this Mac read your transcriptions.")
+                Text("Off. Turn this on to let an MCP client on this Mac read your transcriptions and save them to files.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
