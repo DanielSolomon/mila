@@ -1456,8 +1456,10 @@ enum LLMRunner {
         // it. If cancellation already fired before we got here, `attach`
         // sends SIGTERM right now; the wait-loop below picks up the exit
         // and we throw `.cancelled` instead of resuming with a partial
-        // result the user no longer cares about.
-        handle.attach(process)
+        // result the user no longer cares about. The handle also signals
+        // `exited` on cancel, so the wait below wakes at the cancel rather
+        // than at the deadline and can escalate a child that ignores SIGTERM.
+        handle.attach(process, wake: exited)
 
         // Read stdout/stderr eagerly on background threads so a chatty CLI
         // can't deadlock by filling the OS pipe buffer while we wait for exit.
@@ -1498,18 +1500,37 @@ enum LLMRunner {
         let deadline = DispatchTime.now() + .seconds(Int(timeout.rounded(.up)))
         let timedOut = exited.wait(timeout: deadline) == .timedOut
         if timedOut {
+            process.terminate()
+        }
+        // Woken early by a cancel (`ProcessHandle.terminate` already sent
+        // SIGTERM and signalled `exited`), or past the deadline: either way
+        // a SIGTERM is out and the child may be ignoring it. Before the cancel
+        // path shared this escalation, a cancelled CLI that ignored SIGTERM
+        // ran on until the deadline — for a permanently deleted recording's
+        // summary, that held one of `RecordingSummarizer`'s two slots for the
+        // whole `cliTimeout`.
+        if timedOut || handle.wasTerminated {
             // SIGTERM first; if the CLI ignores it, hard-kill after a short
             // grace period so we don't read half-drained pipes or remove the
             // sandbox out from under a still-running child.
-            process.terminate()
-            if exited.wait(timeout: .now() + 1) == .timedOut {
-                kill(process.processIdentifier, SIGKILL)
+            //
+            // `isRunning` as well as the wait: `exited` is also signalled by
+            // a cancel's wake, so a cancel arriving during a timeout's grace
+            // would satisfy the wait with the child still alive. And it
+            // narrows the bare-pid `kill`'s reuse window: once Foundation has
+            // reaped the child its pid can be reused, and `isRunning` is false
+            // by then (a reap between the check and the `kill` is still
+            // possible, as it always was on the timeout path).
+            if exited.wait(timeout: .now() + 1) == .timedOut || process.isRunning {
+                if process.isRunning {
+                    kill(process.processIdentifier, SIGKILL)
+                }
                 // BOUNDED: `waitUntilExit` has been observed never returning
                 // even after a SIGKILL (macOS 26, sampled live — likely a
                 // reaping race inside NSTask). The child is dead-or-dying
-                // either way, and this is the timedOut path so its exit
-                // status is already being discarded — don't hang the caller
-                // (and its awaiting continuation) on the obituary.
+                // either way, and on this path (timed out or cancelled) its
+                // exit status is already being discarded — don't hang the
+                // caller (and its awaiting continuation) on the obituary.
                 if exited.wait(timeout: .now() + 5) == .timedOut {
                     // `error`: a child that outlives SIGKILL is a genuine
                     // anomaly (see the comment above), and it explains a
@@ -1561,16 +1582,22 @@ enum LLMRunner {
 
         let stdout = String(data: outBox.withLock { $0 }, encoding: .utf8) ?? ""
         let stderr = String(data: errBox.withLock { $0 }, encoding: .utf8) ?? ""
+        let cancelled = handle.wasTerminated
 
         return ProcessOutcome(stdout: stdout,
                               stderr: stderr,
-                              // After a timeout the process was terminated, so
-                              // its status is meaningless — report the standard
-                              // SIGTERM-ish code so callers don't treat it as a
-                              // clean exit.
-                              exitCode: timedOut ? -1 : process.terminationStatus,
+                              // After a timeout or a cancel the process was
+                              // terminated, so its status is meaningless —
+                              // report the standard SIGTERM-ish code so callers
+                              // don't treat it as a clean exit. It must not be
+                              // READ either: on the killed path the bounded
+                              // reap can give up with the child unreaped (the
+                              // macOS 26 race above), and `terminationStatus`
+                              // raises on a process Foundation still thinks
+                              // is running.
+                              exitCode: (timedOut || cancelled) ? -1 : process.terminationStatus,
                               timedOut: timedOut,
-                              cancelled: handle.wasTerminated)
+                              cancelled: cancelled)
     }
 
     /// The ONE working directory every LLM CLI invocation is chdir'd into.
@@ -2164,13 +2191,22 @@ final class ProcessHandle: @unchecked Sendable {
         return _wasTerminated
     }
 
-    func attach(_ p: Process) {
+    /// Woken on `terminate()` so `executeProcess`'s bounded exit wait
+    /// returns at the cancel instead of at the deadline, and can escalate to
+    /// SIGKILL. It is the same semaphore the child's exit signals; an extra
+    /// signal only leaves its value ABOVE where it started, which is safe
+    /// (see `executeProcess`).
+    private var wake: DispatchSemaphore?
+
+    func attach(_ p: Process, wake: DispatchSemaphore) {
         lock.lock(); defer { lock.unlock() }
+        self.wake = wake
         if _wasTerminated {
             // Cancel beat us to attach — the Task was already cancelled
             // before the Process even started. Reach out and SIGTERM right
             // now so the child doesn't even get a head start.
             p.terminate()
+            wake.signal()
             return
         }
         process = p
@@ -2180,5 +2216,6 @@ final class ProcessHandle: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         _wasTerminated = true
         process?.terminate()
+        wake?.signal()
     }
 }

@@ -153,8 +153,9 @@ final class RecordingSummarizer: ObservableObject {
     /// or when the recording has been deleted mid-flight, or was moved to
     /// Recently Deleted while a stale run was out (nothing to export;
     /// this covers the failure and empty-output paths too, not just success —
-    /// `cancel(recordingID:)` is what a permanent delete calls, and that
-    /// surfaces here as a thrown `CancellationError`).
+    /// a permanent delete calls `cancel(recordingID:)` through
+    /// `RecordingStore.permanentlyDeleted`, and the cancelled call surfaces
+    /// here as a thrown `LLMRunnerError.cancelled` / `CancellationError`).
     ///
     /// Exactly one of the branches below fires it per attempt — or hands the
     /// attempt off to a re-run (`Completion.rerun`), whose own
@@ -172,6 +173,15 @@ final class RecordingSummarizer: ObservableObject {
     /// across the whole batch instead of letting all candidates spawn at
     /// once.
     private var backfillQueue: [UUID] = []
+
+    /// Runs `cancel(recordingID:)` has removed from `inFlight` whose tasks
+    /// have not unwound yet, keyed by run token. Their child is still being
+    /// killed (SIGTERM, grace, SIGKILL, bounded reap), so `pumpBackfill`
+    /// counts them against `maxConcurrent`: otherwise another run's
+    /// completion could start new CLIs while the cancelled one is still
+    /// alive. Inserted by `cancel`, removed by token in the cancelled task's
+    /// own `defer`. Also what `awaitInFlight` waits on for a cancelled id.
+    private var cancelledRuns: [UUID: (recordingID: UUID, task: Task<Void, Never>)] = [:]
 
     /// Max concurrent in-flight CLI invocations the summarizer will
     /// schedule from backfill / regeneration. Starts at 2 — high enough
@@ -249,6 +259,19 @@ final class RecordingSummarizer: ObservableObject {
                 self.backfillIfNeeded()
             }
             .store(in: &cancellables)
+
+        // Permanent delete (single row, or emptying Recently Deleted) cancels
+        // that row's summary call. Wired here rather than at each delete call
+        // site so no path can forget it: every permanent removal goes through
+        // `RecordingStore.permanentlyDelete` / `emptyTrash`, and both emit.
+        // Synchronous on the main actor, like the store mutation itself, so
+        // the cancel happens in the same turn as the delete.
+        store.permanentlyDeleted
+            .sink { [weak self] ids in
+                guard let self else { return }
+                for id in ids { self.cancel(recordingID: id) }
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Predicates
@@ -287,9 +310,20 @@ final class RecordingSummarizer: ObservableObject {
     /// has already happened — including a follow-up's: a stale run starts its
     /// follow-up from that same `defer`, so this keeps awaiting until no run
     /// is left for the id.
+    ///
+    /// A run `cancel(recordingID:)` took out of `inFlight` is awaited too,
+    /// until its task has unwound — otherwise a permanent delete would make
+    /// this return before the cancelled call had even started, and a test
+    /// asserting "nothing was stored / exported" would pass vacuously.
     func awaitInFlight(_ recordingID: UUID) async {
-        while let run = inFlight[recordingID] {
-            await run.task.value
+        while true {
+            if let run = inFlight[recordingID] {
+                await run.task.value
+            } else if let cancelled = cancelledRuns.values.first(where: { $0.recordingID == recordingID }) {
+                await cancelled.task.value
+            } else {
+                return
+            }
         }
     }
 
@@ -432,14 +466,34 @@ final class RecordingSummarizer: ObservableObject {
         pumpBackfill()
     }
 
-    /// Cancel any in-flight summary work for `recordingID`. Used when a
-    /// recording is being permanently deleted so we don't spend a CLI
-    /// call on output that has nowhere to land.
+    /// Cancel any summary work for `recordingID`: drop it from the backfill
+    /// queue and cancel its in-flight call. Called for every permanent
+    /// delete via `RecordingStore.permanentlyDeleted` (see `init`), so a
+    /// deleted recording does not spend a CLI call on output that has
+    /// nowhere to go.
+    ///
+    /// Cancelling the task is what stops the child: `LLMRunner.run` bridges
+    /// task cancellation to SIGTERM, escalating to SIGKILL after a short
+    /// grace, with every wait bounded. The slot is handed on once that child
+    /// is gone, not before: the cancelled task's `defer` runs
+    /// `pumpBackfill()` when the call unwinds, so the next queued recording
+    /// starts then, and `maxConcurrent` keeps counting processes that are
+    /// really running rather than ones still being killed.
+    ///
+    /// NOT called when a recording is moved to Recently Deleted. That is
+    /// reversible, and nothing re-queues a restored recording's summary
+    /// until the next launch's backfill, so cancelling (or dropping it from
+    /// the queue) would leave a restored row without one; letting the call
+    /// happen costs only the call the recording was already owed. Emptying
+    /// the bin cancels whatever is still running or queued.
     func cancel(recordingID: UUID) {
         backfillQueue.removeAll { $0 == recordingID }
         if let run = inFlight.removeValue(forKey: recordingID) {
             run.task.cancel()
             inFlightIDs.remove(recordingID)
+            // Still holds its slot until its task unwinds (see
+            // `cancelledRuns`); the task's `defer` gives it back.
+            cancelledRuns[run.token] = (recordingID, run.task)
         }
     }
 
@@ -449,7 +503,7 @@ final class RecordingSummarizer: ObservableObject {
     /// each task's `defer` so as soon as one finishes the next one can
     /// start.
     private func pumpBackfill() {
-        while inFlight.count < maxConcurrent, !backfillQueue.isEmpty {
+        while inFlight.count + cancelledRuns.count < maxConcurrent, !backfillQueue.isEmpty {
             let id = backfillQueue.removeFirst()
             guard let rec = store.recordings.first(where: { $0.id == id }) else {
                 continue
@@ -470,7 +524,19 @@ final class RecordingSummarizer: ObservableObject {
         // whatever copy they hold, and the completion compares against the
         // live row, so a copy that differs from the store would make every
         // run look stale from the start.
-        let recording = latestRecording(recording.id, fallback: recording)
+        //
+        // A row that is no longer in the store gets no call at all. A
+        // request can arrive after a permanent delete with the caller's
+        // stale copy (a post-recording step still finishing after a
+        // discard, a regenerate racing the delete), and the delete's
+        // `permanentlyDeleted` cancel has already fired, so nothing would
+        // ever cancel a call started now: it would hold a slot for the
+        // whole `cliTimeout` for output with nowhere to go (#334). No
+        // signal either, as for any deleted row.
+        guard let recording = liveRecording(recording.id) else {
+            summarizerLog.log("skipped \(self.shortID(recording.id), privacy: .public): recording is gone")
+            return
+        }
         let id = recording.id
         // Dedup: a second request while one is in flight never starts a
         // second overlapping call, so a re-enqueue can't double-bill. It is
@@ -553,6 +619,10 @@ final class RecordingSummarizer: ObservableObject {
                             }
                         }
                     }
+                    // Cancelled: this run's slot was held for it in
+                    // `cancelledRuns` until now. (A no-op for a run that
+                    // was never cancelled.)
+                    self.cancelledRuns[token] = nil
                     // After each completion, try to pull the next
                     // queued backfill candidate in.
                     self.pumpBackfill()

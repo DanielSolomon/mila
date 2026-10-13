@@ -1545,9 +1545,12 @@ final class RecordingSummarizerTests: XCTestCase {
         llm.tool = .claude
         let gate = TestGate()
         var calls = 0
+        var returned = false
         useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
             calls += 1
             if calls == 1 { await gate.wait() }
+            // The completion runs in the same main-actor job as this return.
+            returned = true
             return "SUMMARY"
         }
         var finished = 0
@@ -1556,11 +1559,21 @@ final class RecordingSummarizerTests: XCTestCase {
         let rec = try addRecording(named: "Doomed", text: "a transcript")
         summarizer.summarizeIfNeeded(rec)
         summarizer.regenerate(rec)
+        // The call must be out before the delete. A permanent delete now
+        // cancels the run (#334) and drops it from `inFlight` at once, so
+        // `awaitInFlight` cannot be what waits for it: wait for the stub's
+        // own return instead (the gate ignores the cancel, standing in for
+        // a call that comes back anyway).
+        await waitUntil { calls == 1 }
         store.permanentlyDelete(rec)
+        XCTAssertFalse(summarizer.isSummarizing(rec.id), "the delete cancels the run")
 
         gate.open()
+        await waitUntil { returned }
+        await Task.yield()
         await summarizer.awaitInFlight(rec.id)
 
+        XCTAssertTrue(returned)
         XCTAssertEqual(calls, 1, "no follow-up for a deleted recording")
         XCTAssertEqual(finished, 0, "nothing to export for a deleted recording")
         XCTAssertFalse(summarizer.isSummarizing(rec.id))
@@ -1780,6 +1793,174 @@ final class RecordingSummarizerTests: XCTestCase {
 
         XCTAssertNil(store.recordings.first { $0.id == rec.id }?.summary)
         XCTAssertEqual(finished, 0)
+    }
+
+    // MARK: - Deleting a recording mid-summary
+
+    /// A runner stub for the delete tests: the FIRST call parks until it is
+    /// cancelled (`Task.sleep` throws `CancellationError` at the cancel,
+    /// which is what `LLMRunner.run` turns a cancel into), every later call
+    /// returns at once. `started` records each call's transcript, in order.
+    private func useParkingRunner(_ started: @escaping @MainActor (String) -> Int) {
+        useStubRunner { _, _, transcript, _, _, _, _, _, _, _, _ in
+            if started(transcript) == 1 {
+                try await Task.sleep(nanoseconds: 120 * 1_000_000_000)
+                return "LATE"
+            }
+            return "SUMMARY of \(transcript)"
+        }
+    }
+
+    /// Two completed recordings queued for backfill with ONE slot.
+    /// `store.add` inserts at the front and the backfill scans newest-first,
+    /// so the one added LAST starts first.
+    private func addQueuedPair() throws -> (running: Recording, queued: Recording) {
+        var queued = try addRecording(named: "Queued", text: "queued transcript")
+        queued.status = .completed
+        store.update(queued)
+        var running = try addRecording(named: "Running", text: "running transcript")
+        running.status = .completed
+        store.update(running)
+        return (running, queued)
+    }
+
+    /// Permanently deleting a recording whose summary is being generated
+    /// cancels that call, and the queued recording takes the freed slot.
+    /// Nothing used to call `cancel(recordingID:)`, so the deleted row's CLI
+    /// ran to completion holding the slot, and the queue waited behind it.
+    func test_permanently_deleting_a_recording_mid_summary_cancels_it_and_starts_the_next() async throws {
+        llm.tool = .claude
+        var started: [String] = []
+        useParkingRunner { started.append($0); return started.count }
+        summarizer.maxConcurrent = 1
+        var finished: [UUID] = []
+        summarizer.onSummaryFinished = { finished.append($0.id) }
+
+        let (running, queued) = try addQueuedPair()
+        summarizer.backfillIfNeeded()
+        await waitUntil { started.count == 1 }
+        XCTAssertEqual(started, ["running transcript"])
+        XCTAssertTrue(summarizer.isSummarizing(running.id))
+        XCTAssertFalse(summarizer.isSummarizing(queued.id), "one slot: the second waits")
+
+        store.permanentlyDelete(running)
+        XCTAssertFalse(summarizer.isSummarizing(running.id),
+                       "the delete must cancel the deleted row's summary")
+
+        await waitUntil { started.count == 2 }
+        XCTAssertEqual(started, ["running transcript", "queued transcript"],
+                       "the queued recording must start once the cancelled call has unwound")
+        await summarizer.awaitInFlight(queued.id)
+        XCTAssertEqual(store.recordings.first { $0.id == queued.id }?.summary,
+                       "SUMMARY of queued transcript")
+        XCTAssertEqual(finished, [queued.id], "a deleted recording is never signalled")
+    }
+
+    /// The same through "Empty Recently Deleted" — and moving a row to the
+    /// bin on its own does NOT cancel: that is reversible, and nothing
+    /// re-queues a restored row's summary, so the call is let finish.
+    func test_emptying_the_trash_cancels_a_trashed_rows_summary_but_trashing_does_not() async throws {
+        llm.tool = .claude
+        var started: [String] = []
+        useParkingRunner { started.append($0); return started.count }
+        summarizer.maxConcurrent = 1
+
+        let (running, queued) = try addQueuedPair()
+        summarizer.backfillIfNeeded()
+        await waitUntil { started.count == 1 }
+        XCTAssertTrue(summarizer.isSummarizing(running.id))
+
+        store.softDelete(running)
+        XCTAssertTrue(summarizer.isSummarizing(running.id),
+                      "moving to Recently Deleted must not cancel the summary")
+
+        XCTAssertEqual(store.emptyTrash(), 1)
+        XCTAssertFalse(summarizer.isSummarizing(running.id))
+        await waitUntil { started.count == 2 }
+        XCTAssertEqual(started, ["running transcript", "queued transcript"])
+        await summarizer.awaitInFlight(queued.id)
+        XCTAssertEqual(store.recordings.first { $0.id == queued.id }?.summary,
+                       "SUMMARY of queued transcript")
+    }
+
+    /// A request that arrives AFTER a permanent delete, with the caller's
+    /// stale copy, starts no call: the delete's cancel has already fired, so
+    /// nothing would ever stop it (e.g. a post-recording step finishing after
+    /// a discard, or a regenerate racing the delete).
+    func test_a_request_for_a_permanently_deleted_recording_starts_no_call() async throws {
+        llm.tool = .claude
+        var calls = 0
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            calls += 1
+            return "SUMMARY"
+        }
+        let rec = try addRecording(named: "Gone", text: "a transcript")
+        store.permanentlyDelete(rec)
+
+        summarizer.summarizeIfNeeded(rec)
+        summarizer.regenerate(rec)
+        XCTAssertFalse(summarizer.isSummarizing(rec.id))
+        await summarizer.awaitInFlight(rec.id)
+        await Task.yield()
+        XCTAssertEqual(calls, 0, "a deleted recording must not cost an LLM call")
+    }
+
+    /// A cancelled run keeps its slot until its call has actually unwound —
+    /// in production, until `LLMRunner` has killed and reaped the child.
+    /// `cancel` drops the run from `inFlight` at once, so without that
+    /// accounting another run's completion would start new CLIs while the
+    /// cancelled one was still alive, briefly running more than
+    /// `maxConcurrent`. The stub for "a" ignores the cancel until its gate
+    /// opens, standing in for a child that takes a while to die.
+    func test_a_cancelled_run_holds_its_slot_until_it_unwinds() async throws {
+        llm.tool = .claude
+        let gateA = TestGate(), gateB = TestGate(), gateC = TestGate()
+        var started: [String] = []
+        useStubRunner { _, _, transcript, _, _, _, _, _, _, _, _ in
+            started.append(transcript)
+            switch transcript {
+            case "a": await gateA.wait(); throw CancellationError()
+            case "b": await gateB.wait()
+            case "c": await gateC.wait()
+            default: break
+            }
+            return "SUMMARY of \(transcript)"
+        }
+        summarizer.maxConcurrent = 2
+
+        // `add` inserts at the front and the scan is newest-first, so the
+        // queue order is a, b, c, d.
+        var rows: [String: Recording] = [:]
+        for name in ["d", "c", "b", "a"] {
+            var rec = try addRecording(named: name, text: name)
+            rec.status = .completed
+            store.update(rec)
+            rows[name] = rec
+        }
+        summarizer.backfillIfNeeded()
+        await waitUntil { started.count == 2 }
+        XCTAssertEqual(started, ["a", "b"])
+
+        store.permanentlyDelete(try XCTUnwrap(rows["a"]))
+        gateB.open()
+        await waitUntil { started.count == 3 }
+        XCTAssertEqual(started, ["a", "b", "c"],
+                       "b's slot goes to c")
+        // b has finished and c is running; a is still unwinding, so it
+        // still counts and d must wait. b's `defer` ran the pump in the job
+        // that started c, so a wrongly started d would already be in flight.
+        XCTAssertFalse(summarizer.isSummarizing(try XCTUnwrap(rows["d"]).id),
+                       "a cancelled run that has not unwound must still hold its slot")
+        XCTAssertEqual(started, ["a", "b", "c"])
+
+        gateA.open()
+        await waitUntil { started.count == 4 }
+        XCTAssertEqual(started, ["a", "b", "c", "d"],
+                       "the slot is handed on once the cancelled run unwinds")
+        gateC.open()
+        await summarizer.awaitInFlight(try XCTUnwrap(rows["c"]).id)
+        await summarizer.awaitInFlight(try XCTUnwrap(rows["d"]).id)
+        XCTAssertEqual(store.recordings.first { $0.id == rows["d"]?.id }?.summary, "SUMMARY of d")
     }
 
     /// The other half of #318: when the row's FIRST summary finishes while a
