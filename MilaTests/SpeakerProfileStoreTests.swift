@@ -196,6 +196,68 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertEqual(store.profiles[0].name, "Bob")
     }
 
+    /// Removing a name from Settings → Known speakers used to leave its voice
+    /// profile behind, and recognition kept labelling that voice with the
+    /// removed name in every new recording. Case-insensitive, like
+    /// `SpeakerDirectory.remove`, and persisted.
+    func test_forgetSpeaker_deletes_the_profile_and_persists() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = makeStore(in: dir)
+        store.updateProfile(name: "Daniel Solomon (from Daniel)", embedding: [1], sampleCount: 1)
+        store.updateProfile(name: "Bob", embedding: [2], sampleCount: 1)
+
+        var seen: [SpeakerProfileStore.Deletion] = []
+        store.addDeletionObserver { seen.append($0) }
+        store.forgetSpeaker(named: "daniel solomon (FROM daniel)")
+
+        XCTAssertEqual(store.profiles.map(\.name), ["Bob"])
+        XCTAssertEqual(seen, [.named(["Daniel Solomon (from Daniel)"])])
+        XCTAssertEqual(makeStore(in: dir).profiles.map(\.name), ["Bob"])
+    }
+
+    /// While the feature is off the profiles aren't in memory, so the delete
+    /// has to reach the file — otherwise turning recognition back on would
+    /// bring the forgotten voice back.
+    func test_forgetSpeaker_while_off_deletes_from_disk() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            let store = makeStore(in: dir)
+            store.updateProfile(name: "Alice", embedding: [1], sampleCount: 1)
+            store.updateProfile(name: "Bob", embedding: [2], sampleCount: 3)
+        }
+
+        let off = makeStore(in: dir, enabled: false)
+        var seen: [SpeakerProfileStore.Deletion] = []
+        off.addDeletionObserver { seen.append($0) }
+        off.forgetSpeaker(named: "Alice")
+
+        XCTAssertTrue(off.profiles.isEmpty, "nothing is loaded into memory while off")
+        XCTAssertEqual(seen, [.named(["Alice"])])
+        let reloaded = makeStore(in: dir)
+        XCTAssertEqual(reloaded.profiles.map(\.name), ["Bob"])
+        XCTAssertEqual(reloaded.profiles.first?.sampleCount, 3, "the surviving row is intact")
+    }
+
+    func test_forgetSpeaker_without_a_profile_is_a_no_op() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = makeStore(in: dir)
+        store.updateProfile(name: "Alice", embedding: [1], sampleCount: 1)
+
+        var seen: [SpeakerProfileStore.Deletion] = []
+        store.addDeletionObserver { seen.append($0) }
+        store.forgetSpeaker(named: "Nobody")
+        makeStore(in: dir, enabled: false).forgetSpeaker(named: "Nobody")
+
+        XCTAssertTrue(seen.isEmpty)
+        XCTAssertEqual(makeStore(in: dir).profiles.map(\.name), ["Alice"])
+    }
+
     func test_renameProfile() throws {
         let dir = tempDir()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

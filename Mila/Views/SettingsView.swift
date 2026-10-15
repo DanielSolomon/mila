@@ -2618,13 +2618,14 @@ private struct DiarizationSettingsTabContent: View {
 /// popover) are offered in every future recording's rename list.
 private struct KnownSpeakersSection: View {
     @EnvironmentObject private var directory: SpeakerDirectory
+    @EnvironmentObject private var profileStore: SpeakerProfileStore
     @State private var newName = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Known speakers")
                 .font(.callout.weight(.semibold))
-            Text("Names you can assign to speakers by clicking their label in a transcript. Removing a name here doesn't change recordings it's already assigned to.")
+            Text("Names you can assign to speakers by clicking their label in a transcript. Removing a name here also deletes its voice profile, so it stops being recognised in new recordings; recordings it's already assigned to are unchanged.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -2638,6 +2639,11 @@ private struct KnownSpeakersSection: View {
                                 Spacer()
                                 Button {
                                     directory.remove(name)
+                                    // The name list and the voice profiles
+                                    // are separate stores; recognition reads
+                                    // only the profiles, so dropping just the
+                                    // name left the voice labelling speakers.
+                                    profileStore.forgetSpeaker(named: name)
                                 } label: {
                                     Image(systemName: "xmark.circle.fill")
                                         .foregroundStyle(.secondary)

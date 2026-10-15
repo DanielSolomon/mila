@@ -551,6 +551,69 @@ final class SpeakerProfileStore: ObservableObject {
         if !removed.isEmpty { notifyDeleted(.named(removed)) }
     }
 
+    /// Delete the voice profile behind a name the user removed from Settings
+    /// → Known speakers.
+    ///
+    /// **Removing the name alone is not enough.** The pick-list
+    /// (`SpeakerDirectory`) and the voice profiles are separate files, and
+    /// recognition reads only the profiles: a removed name whose profile
+    /// survived went on being seeded into every recording and labelling the
+    /// matched speaker with the name the user had just thrown away — an
+    /// imported "Daniel Solomon (from Daniel)" kept reappearing that way.
+    ///
+    /// Matches case-insensitively, the same way `SpeakerDirectory.remove`
+    /// does, so the entry and the profile go together even when their
+    /// spelling drifted in case.
+    ///
+    /// Not gated on the feature being on, like `deleteAllProfiles` and for
+    /// the same reason. While off the profiles are not in memory, so the file
+    /// is filtered on disk instead (and nothing parsed is kept) — otherwise
+    /// switching recognition back on would resurrect the voice.
+    func forgetSpeaker(named name: String) {
+        let matches: (String) -> Bool = {
+            $0.caseInsensitiveCompare(name) == .orderedSame
+        }
+        let removed: Set<String>
+        if settings.isEnabled {
+            removed = Set(profiles.map(\.name).filter(matches))
+            guard !removed.isEmpty else { return }
+            profiles.removeAll { matches($0.name) }
+            save()
+        } else {
+            removed = removeFromDisk(where: matches)
+            guard !removed.isEmpty else { return }
+        }
+        notifyDeleted(.named(removed))
+    }
+
+    /// The off-state half of `forgetSpeaker`: drop matching rows from the
+    /// file without decoding them into `VoiceProfile`s or keeping anything in
+    /// memory. Rows pass through untouched otherwise. Returns the names it
+    /// removed; on any read or write failure removes nothing and logs.
+    private func removeFromDisk(where matches: (String) -> Bool) -> Set<String> {
+        guard fileManager.fileExists(atPath: storeURL.path) else { return [] }
+        do {
+            let data = try Data(contentsOf: storeURL)
+            guard let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+                return []
+            }
+            var removed: Set<String> = []
+            let kept = rows.filter { row in
+                guard let rowName = row["name"] as? String, matches(rowName) else { return true }
+                removed.insert(rowName)
+                return false
+            }
+            guard !removed.isEmpty else { return [] }
+            let out = try JSONSerialization.data(withJSONObject: kept,
+                                                 options: [.prettyPrinted, .sortedKeys])
+            try out.write(to: storeURL, options: .atomic)
+            return removed
+        } catch {
+            profileLog.log("forgetSpeaker error: \(error.localizedDescription, privacy: .public)")
+            return []
+        }
+    }
+
     /// Remove every stored voice profile — the "Delete voice profiles"
     /// button in Settings.
     ///
