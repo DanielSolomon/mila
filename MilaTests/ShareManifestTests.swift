@@ -234,6 +234,12 @@ final class ShareManifestTests: XCTestCase {
             // key and can hold it to the allowlist.
             retranscriptionPriorState: .init(status: .completed, language: "he",
                                              modelName: "Earlier model"),
+            // Pending, unaccepted suggestion; set so the key-set test below
+            // sees the key and can hold it to the allowlist.
+            speakerNameSuggestions: [
+                SpeakerNameSuggestion(speaker: "SPEAKER_01", name: "John",
+                                      evidence: "hi there, John here", origin: .transcript),
+            ],
             // Local repair bookkeeping; set so the key-set test sees the key.
             untranscribedSpans: [UntranscribedSpan(start: 12, end: 15.5)])
     }
@@ -329,6 +335,11 @@ final class ShareManifestTests: XCTestCase {
             // completed transcript in the language the manifest states; the
             // sender's in-flight run is not its concern.
             "retranscriptionPriorState",
+            // Unaccepted speaker-name suggestions (#348) — the sender's
+            // provider's guesses about the sender's recording. A share carries
+            // confirmed names (`speakerNames`); a pending guess arriving on
+            // the receiver's side would read as the sender's decision.
+            "speakerNameSuggestions",
             // Which spans of the SENDER's audio its transcript is missing
             // (#355) — bookkeeping for the sender's own "Retry missing parts".
             // The receiver imports the transcript as sent; a full
